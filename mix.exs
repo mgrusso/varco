@@ -5,7 +5,7 @@ defmodule Varco.MixProject do
     [
       app: :varco,
       version: "0.1.0",
-      elixir: "~> 1.20",
+      elixir: ">= 1.17.0",
       start_permanent: Mix.env() == :prod,
       deps: deps()
     ]

@@ -35,6 +35,9 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
+      - name: Compile dependencies
+        run: mix deps.compile
+
       - name: Run test suite
         run: mix test
 
