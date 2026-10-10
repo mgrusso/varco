@@ -1,0 +1,25 @@
+# Varco Sample Configuration
+routes:
+  - id: api-service
+    hosts:
+      - api.local
+      - localhost
+    path: /api
+    path_type: prefix
+    upstreams:
+      - http://127.0.0.1:4000
+    strip_path: false
+    tls: true
+    load_balancer: round_robin
+    response_headers:
+      - key: x-served-by
+        value: "varco"
+
+  - id: web-frontend
+    hosts:
+      - app.local
+    path: /
+    path_type: prefix
+    upstreams:
+      - http://127.0.0.1:3000
+    tls: true
