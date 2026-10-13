@@ -265,9 +265,10 @@ defmodule Varco.Proxy.Handler do
     # Prepare Headers
     headers = prepare_upstream_headers(conn, route)
 
-    # Prepare streaming request body (zero buffering in RAM)
+    # Read client request body synchronously in the Plug process before sending response
+    # to ensure Bandit HTTP/2 stream state machine transitions cleanly without remote_closed error
     timeout = route.timeout || 300_000
-    body = build_request_body(conn, timeout)
+    {:ok, body, conn} = read_client_body(conn, timeout)
 
     case parse_method(conn.method) do
       {:ok, method} ->
@@ -323,15 +324,6 @@ defmodule Varco.Proxy.Handler do
 
         case result do
           {:ok, %{conn: completed_conn, status: status, bytes: bytes}} ->
-            completed_conn =
-              case Process.delete(:varco_last_conn) do
-                %Plug.Conn{adapter: updated_adapter} ->
-                  %{completed_conn | adapter: updated_adapter}
-
-                _ ->
-                  completed_conn
-              end
-
             emit_telemetry(start_time, completed_conn, status, route.id, upstream, bytes)
             halt(completed_conn)
 
@@ -482,14 +474,6 @@ defmodule Varco.Proxy.Handler do
     end)
   end
 
-  defp build_request_body(conn, timeout) do
-    if has_request_body?(conn) do
-      {:stream, stream_request_body(conn, timeout)}
-    else
-      nil
-    end
-  end
-
   defp has_request_body?(conn) do
     cond do
       match?({Plug.Adapters.Test.Conn, body} when body not in ["", nil], conn.adapter) ->
@@ -510,35 +494,41 @@ defmodule Varco.Proxy.Handler do
     end
   end
 
-  defp stream_request_body(conn, timeout) do
-    chunk_size = 64 * 1024
+  defp read_client_body(conn, timeout) do
+    if has_request_body?(conn) do
+      max_size = 500 * 1024 * 1024
+      chunk_size = 1024 * 1024
 
-    Stream.resource(
-      fn -> {:continue, conn} end,
-      fn
-        {:continue, c} ->
-          case read_body(c, length: chunk_size, read_length: chunk_size, read_timeout: timeout) do
-            {:ok, "", next_c} ->
-              Process.put(:varco_last_conn, next_c)
-              {:halt, {:done, next_c}}
+      case read_body(conn, length: max_size, read_length: chunk_size, read_timeout: timeout) do
+        {:ok, body, conn} ->
+          {:ok, body, conn}
 
-            {:ok, chunk, next_c} ->
-              Process.put(:varco_last_conn, next_c)
-              {[chunk], {:done, next_c}}
+        {:more, chunk, conn} ->
+          read_more_client_body(conn, [chunk], max_size, chunk_size, timeout)
 
-            {:more, chunk, next_c} ->
-              Process.put(:varco_last_conn, next_c)
-              {[chunk], {:continue, next_c}}
+        {:error, reason} ->
+          Logger.warning("Error reading client request body: #{inspect(reason)}")
+          {:ok, "", conn}
+      end
+    else
+      {:ok, nil, conn}
+    end
+  end
 
-            {:error, _reason} ->
-              {:halt, {:done, c}}
-          end
+  defp read_more_client_body(conn, acc, max_size, chunk_size, timeout) do
+    case read_body(conn, length: max_size, read_length: chunk_size, read_timeout: timeout) do
+      {:ok, chunk, conn} ->
+        full = IO.iodata_to_binary(Enum.reverse([chunk | acc]))
+        {:ok, full, conn}
 
-        {:done, _c} ->
-          {:halt, :done}
-      end,
-      fn _ -> :ok end
-    )
+      {:more, chunk, conn} ->
+        read_more_client_body(conn, [chunk | acc], max_size, chunk_size, timeout)
+
+      {:error, reason} ->
+        Logger.warning("Error reading client request body chunk: #{inspect(reason)}")
+        full = IO.iodata_to_binary(Enum.reverse(acc))
+        {:ok, full, conn}
+    end
   end
 
   defp websocket_upgrade?(conn) do
