@@ -67,19 +67,19 @@ defmodule Varco.Discovery.Kubernetes do
       scheme = Map.get(annotations, "varco.io/upstream-scheme", "http")
 
       timeout =
-        case Map.get(annotations, "varco.io/proxy-timeout") ||
-               Map.get(annotations, "varco.io/timeout") do
-          nil ->
+        cond do
+          val =
+              Map.get(annotations, "varco.io/proxy-timeout") ||
+                Map.get(annotations, "varco.io/timeout") ->
+            parse_timeout_val(val, :ms)
+
+          val =
+              Map.get(annotations, "nginx.ingress.kubernetes.io/proxy-read-timeout") ||
+                Map.get(annotations, "nginx.ingress.kubernetes.io/proxy-send-timeout") ->
+            parse_timeout_val(val, :seconds)
+
+          true ->
             300_000
-
-          "infinity" ->
-            :infinity
-
-          val ->
-            case Integer.parse(val) do
-              {ms, ""} when ms > 0 -> ms
-              _ -> 300_000
-            end
         end
 
       rules = Map.get(spec, "rules", [])
@@ -186,14 +186,47 @@ defmodule Varco.Discovery.Kubernetes do
     end
   end
 
-  defp matches_ingress_class?(ingress, expected_ingress_class) do
+  defp parse_timeout_val(val, unit) do
+    case val do
+      "infinity" ->
+        :infinity
+
+      num_str when is_binary(num_str) ->
+        case Integer.parse(num_str) do
+          {num, ""} when num > 0 ->
+            if unit == :seconds, do: num * 1000, else: num
+
+          _ ->
+            300_000
+        end
+
+      _ ->
+        300_000
+    end
+  end
+
+  defp matches_ingress_class?(ingress, expected) when is_binary(expected) do
+    cond do
+      expected == "*" ->
+        true
+
+      String.contains?(expected, ",") ->
+        classes = expected |> String.split(",") |> Enum.map(&String.trim/1)
+        matches_ingress_class?(ingress, classes)
+
+      true ->
+        matches_ingress_class?(ingress, [expected])
+    end
+  end
+
+  defp matches_ingress_class?(ingress, classes) when is_list(classes) do
     spec_class = get_in(ingress, ["spec", "ingressClassName"])
     annotation_class = get_in(ingress, ["metadata", "annotations", "kubernetes.io/ingress.class"])
 
     cond do
-      spec_class == expected_ingress_class -> true
-      annotation_class == expected_ingress_class -> true
-      spec_class == nil and annotation_class == nil -> true
+      spec_class in classes -> true
+      annotation_class in classes -> true
+      spec_class == nil and annotation_class == nil and "varco" in classes -> true
       true -> false
     end
   end
@@ -219,7 +252,8 @@ defmodule Varco.Discovery.Kubernetes do
     insecure_skip_tls_verify =
       Keyword.get(opts, :insecure_skip_tls_verify, default_insecure_skip_verify?())
 
-    ingress_class = Keyword.get(opts, :ingress_class, @ingress_class)
+    default_class = System.get_env("VARCO_K8S_INGRESS_CLASS", @ingress_class)
+    ingress_class = Keyword.get(opts, :ingress_class, default_class)
 
     state = %{
       enabled: enabled,
