@@ -167,6 +167,73 @@ defmodule Varco.DiscoveryTest do
       assert route.upstreams == ["http://upload-svc.default.svc.cluster.local:80"]
     end
 
+    test "parses nginx proxy-read-timeout annotation as fallback" do
+      ingress = %{
+        "metadata" => %{
+          "annotations" => %{
+            "nginx.ingress.kubernetes.io/proxy-read-timeout" => "3600"
+          }
+        },
+        "spec" => %{
+          "ingressClassName" => "varco",
+          "rules" => [
+            %{
+              "host" => "s3.domain.tld",
+              "http" => %{
+                "paths" => [
+                  %{
+                    "path" => "/",
+                    "backend" => %{
+                      "service" => %{
+                        "name" => "s3-svc",
+                        "port" => %{"number" => 9000}
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+
+      assert {:ok, [route]} = Kubernetes.ingress_to_routes(ingress)
+      assert route.timeout == 3_600_000
+    end
+
+    test "supports multi-class matching e.g. nginx,varco and wildcard *" do
+      ingress_nginx = %{
+        "spec" => %{
+          "ingressClassName" => "nginx",
+          "rules" => [
+            %{
+              "host" => "nginx-app.local",
+              "http" => %{
+                "paths" => [
+                  %{
+                    "path" => "/",
+                    "backend" => %{
+                      "service" => %{
+                        "name" => "app-svc",
+                        "port" => %{"number" => 80}
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+
+      # Matches when expected is "nginx,varco"
+      assert {:ok, [route]} = Kubernetes.ingress_to_routes(ingress_nginx, "nginx,varco")
+      assert route.hosts == ["nginx-app.local"]
+
+      # Matches wildcard "*"
+      assert {:ok, [_]} = Kubernetes.ingress_to_routes(ingress_nginx, "*")
+    end
+
     test "extracts TLS secret references from Ingress spec" do
       ingress = %{
         "metadata" => %{"namespace" => "staging"},

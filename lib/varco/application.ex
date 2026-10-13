@@ -45,6 +45,8 @@ defmodule Varco.Application do
 
     case Supervisor.start_link(children, opts) do
       {:ok, pid} ->
+        # Attach structured stdout access logger
+        attach_access_logger_if_enabled()
         # Load static config file if present
         load_static_config_if_exists()
         {:ok, pid}
@@ -81,5 +83,32 @@ defmodule Varco.Application do
       Logger.info("Loading initial configuration from #{config_path}")
       Varco.Discovery.Static.load_file(config_path)
     end
+  end
+
+  defp attach_access_logger_if_enabled do
+    if System.get_env("VARCO_ACCESS_LOG") not in ["false", "0"] do
+      :telemetry.attach(
+        "varco-stdout-access-logger",
+        [:varco, :proxy, :request],
+        &__MODULE__.handle_proxy_telemetry/4,
+        nil
+      )
+    end
+  end
+
+  @doc false
+  def handle_proxy_telemetry(_event, measurements, metadata, _config) do
+    duration_ms = System.convert_time_unit(measurements.duration, :native, :millisecond)
+    bytes = Map.get(measurements, :bytes_sent, 0)
+    method = metadata.method
+    host = metadata.host
+    path = metadata.path
+    status = metadata.status
+    upstream = metadata.upstream || "-"
+    route_id = metadata.route_id || "-"
+
+    Logger.info(
+      "[ACCESS] #{method} #{host}#{path} -> #{status} (#{duration_ms}ms, #{bytes}B) [#{route_id} -> #{upstream}]"
+    )
   end
 end
