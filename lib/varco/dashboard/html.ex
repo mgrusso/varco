@@ -70,8 +70,8 @@ defmodule Varco.Dashboard.HTML do
           </div>
           <div class="header-meta">
             <div class="node-chip">
-              <div class="dot"></div>
-              <span id="node-name">Loading...</span>
+              <div class="dot" id="node-dot"></div>
+              <span id="node-name">Connecting...</span>
             </div>
             <a href="/api/v1/certificates/ca" class="btn-ca" download="varco-root-ca.crt">Export Root CA</a>
           </div>
@@ -138,52 +138,128 @@ defmodule Varco.Dashboard.HTML do
       </div>
 
       <script>
+        function escapeHtml(str) {
+          if (str === null || str === undefined) return '';
+          return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+        }
+
+        function formatDate(dateStr) {
+          if (!dateStr) return 'N/A';
+          try {
+            const d = new Date(dateStr);
+            return isNaN(d.getTime()) ? String(dateStr) : d.toLocaleDateString();
+          } catch (_) {
+            return String(dateStr);
+          }
+        }
+
+        async function fetchEndpoint(url) {
+          try {
+            const res = await fetch(url);
+            if (!res.ok) {
+              console.warn(`Fetch ${url} failed with status ${res.status}`);
+              return null;
+            }
+            return await res.json();
+          } catch (e) {
+            console.warn(`Fetch ${url} network error:`, e);
+            return null;
+          }
+        }
+
         async function refreshData() {
           try {
             const [routesRes, certsRes, clusterRes, metricsRes] = await Promise.all([
-              fetch('/api/v1/routes').then(r => r.json()),
-              fetch('/api/v1/certificates').then(r => r.json()),
-              fetch('/api/v1/cluster').then(r => r.json()),
-              fetch('/api/v1/metrics').then(r => r.json())
+              fetchEndpoint('/api/v1/routes'),
+              fetchEndpoint('/api/v1/certificates'),
+              fetchEndpoint('/api/v1/cluster'),
+              fetchEndpoint('/api/v1/metrics')
             ]);
 
-            // Update stats
-            document.getElementById('stat-routes').textContent = routesRes.length;
-            document.getElementById('stat-certs').textContent = certsRes.length;
-            document.getElementById('stat-nodes').textContent = clusterRes.node_count;
-            document.getElementById('stat-mem').textContent = (metricsRes.beam_memory_bytes / 1024 / 1024).toFixed(1) + ' MB';
-            document.getElementById('node-name').textContent = clusterRes.current_node;
+            const dot = document.getElementById('node-dot');
+            const nodeName = document.getElementById('node-name');
+
+            if (clusterRes) {
+              if (dot) dot.style.background = 'var(--success)';
+              if (nodeName) nodeName.textContent = clusterRes.current_node || 'varco@standalone';
+              const statNodes = document.getElementById('stat-nodes');
+              if (statNodes) statNodes.textContent = clusterRes.node_count ?? 1;
+            } else {
+              if (dot) dot.style.background = 'var(--warning)';
+              if (nodeName && (nodeName.textContent === 'Connecting...' || nodeName.textContent === 'Loading...')) {
+                nodeName.textContent = 'Connecting...';
+              }
+            }
+
+            if (metricsRes) {
+              const statMem = document.getElementById('stat-mem');
+              if (statMem && metricsRes.beam_memory_bytes !== undefined) {
+                statMem.textContent = (metricsRes.beam_memory_bytes / 1024 / 1024).toFixed(1) + ' MB';
+              }
+            }
 
             // Render routes
-            const tbody = document.getElementById('routes-table');
-            if (routesRes.length === 0) {
-              tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--muted);">No routes configured yet. Add routes via REST API, Docker labels, or Kubernetes Ingress.</td></tr>';
-            } else {
-              tbody.innerHTML = routesRes.map(r => `
-                <tr>
-                  <td><strong>${r.id}</strong></td>
-                  <td>${r.hosts.length ? r.hosts.map(h => `<code>${h}</code>`).join(' ') : '<em>(any host)</em>'}</td>
-                  <td><code>${r.path}</code></td>
-                  <td>${r.upstreams.map(u => `<code>${u}</code>`).join('<br>')}</td>
-                  <td><span class="badge ${r.tls ? 'badge-tls' : 'badge-plain'}">${r.tls ? 'HTTPS / TLS' : 'Plain HTTP'}</span></td>
-                  <td>${r.load_balancer}</td>
-                </tr>
-              `).join('');
+            if (Array.isArray(routesRes)) {
+              const statRoutes = document.getElementById('stat-routes');
+              if (statRoutes) statRoutes.textContent = routesRes.length;
+
+              const tbody = document.getElementById('routes-table');
+              if (tbody) {
+                if (routesRes.length === 0) {
+                  tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--muted);">No routes configured yet. Add routes via REST API, Docker labels, or Kubernetes Ingress.</td></tr>';
+                } else {
+                  tbody.innerHTML = routesRes.map(r => {
+                    const hosts = Array.isArray(r.hosts) && r.hosts.length
+                      ? r.hosts.map(h => `<code>${escapeHtml(h)}</code>`).join(' ')
+                      : '<em>(any host)</em>';
+                    const upstreams = Array.isArray(r.upstreams) && r.upstreams.length
+                      ? r.upstreams.map(u => `<code>${escapeHtml(u)}</code>`).join('<br>')
+                      : '<em>(no upstreams)</em>';
+                    return `
+                      <tr>
+                        <td><strong>${escapeHtml(r.id || '')}</strong></td>
+                        <td>${hosts}</td>
+                        <td><code>${escapeHtml(r.path || '/')}</code></td>
+                        <td>${upstreams}</td>
+                        <td><span class="badge ${r.tls ? 'badge-tls' : 'badge-plain'}">${r.tls ? 'HTTPS / TLS' : 'Plain HTTP'}</span></td>
+                        <td>${escapeHtml(r.load_balancer || 'round_robin')}</td>
+                      </tr>
+                    `;
+                  }).join('');
+                }
+              }
             }
 
             // Render certs
-            const certsBody = document.getElementById('certs-table');
-            if (certsRes.length === 0) {
-              certsBody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--muted);">No certificates loaded.</td></tr>';
-            } else {
-              certsBody.innerHTML = certsRes.map(c => `
-                <tr>
-                  <td><strong>${c.domain}</strong></td>
-                  <td><span class="badge ${c.type === 'self_signed' ? 'badge-self' : 'badge-custom'}">${c.type}</span></td>
-                  <td>${(c.domains || []).join(', ') || '-'}</td>
-                  <td>${c.expires_at ? new Date(c.expires_at).toLocaleDateString() : 'N/A'}</td>
-                </tr>
-              `).join('');
+            if (Array.isArray(certsRes)) {
+              const statCerts = document.getElementById('stat-certs');
+              if (statCerts) statCerts.textContent = certsRes.length;
+
+              const certsBody = document.getElementById('certs-table');
+              if (certsBody) {
+                if (certsRes.length === 0) {
+                  certsBody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--muted);">No certificates loaded.</td></tr>';
+                } else {
+                  certsBody.innerHTML = certsRes.map(c => {
+                    const domains = Array.isArray(c.domains) && c.domains.length
+                      ? c.domains.map(d => escapeHtml(d)).join(', ')
+                      : '-';
+                    return `
+                      <tr>
+                        <td><strong>${escapeHtml(c.domain || '')}</strong></td>
+                        <td><span class="badge ${c.type === 'self_signed' ? 'badge-self' : 'badge-custom'}">${escapeHtml(c.type || '')}</span></td>
+                        <td>${domains}</td>
+                        <td>${formatDate(c.expires_at)}</td>
+                      </tr>
+                    `;
+                  }).join('');
+                }
+              }
             }
           } catch (e) {
             console.error('Failed to update dashboard data', e);

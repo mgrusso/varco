@@ -372,7 +372,22 @@ defmodule Varco.Proxy.Handler do
   end
 
   defp should_redirect_to_https?(conn, route) do
-    route.tls and conn.scheme == :http
+    if route.tls do
+      case get_req_header(conn, "x-forwarded-proto") do
+        [proto | _] ->
+          proto
+          |> String.split(",")
+          |> List.first()
+          |> to_string()
+          |> String.trim()
+          |> String.downcase() != "https" and conn.scheme == :http
+
+        [] ->
+          conn.scheme == :http
+      end
+    else
+      false
+    end
   end
 
   defp redirect_to_https(conn, host) do

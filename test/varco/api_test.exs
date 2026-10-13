@@ -18,6 +18,31 @@ defmodule Varco.APITest do
     assert conn.resp_body =~ "Reverse Proxy Dashboard"
   end
 
+  test "redirects root path to /dashboard" do
+    conn =
+      Plug.Test.conn(:get, "/")
+      |> Router.call([])
+
+    assert conn.status == 302
+    assert Plug.Conn.get_resp_header(conn, "location") == ["/dashboard"]
+  end
+
+  test "supports CORS preflight OPTIONS requests and sets CORS headers on JSON endpoints" do
+    conn =
+      Plug.Test.conn(:options, "/api/v1/routes")
+      |> Router.call([])
+
+    assert conn.status == 204
+    assert Plug.Conn.get_resp_header(conn, "access-control-allow-origin") == ["*"]
+
+    conn_get =
+      Plug.Test.conn(:get, "/api/v1/routes")
+      |> Router.call([])
+
+    assert conn_get.status == 200
+    assert Plug.Conn.get_resp_header(conn_get, "access-control-allow-origin") == ["*"]
+  end
+
   test "serves ping health check" do
     conn =
       Plug.Test.conn(:get, "/api/v1/ping")
