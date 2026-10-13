@@ -43,13 +43,17 @@ defmodule Varco.TLS.CertificateStore do
         build_ssl_options(cert_data)
 
       nil ->
-        # On-demand generation via GenServer (atomic & thread-safe)
-        case GenServer.call(__MODULE__, {:ensure_certificate, host}, 5000) do
-          {:ok, %{der_cert: _} = cert_data} ->
-            build_ssl_options(cert_data)
+        # Only request dynamic cert generation if host is configured in routing (prevents DoS)
+        if Varco.Routing.Table.host_configured?(host) do
+          case GenServer.call(__MODULE__, {:ensure_certificate, host}, 5000) do
+            {:ok, %{der_cert: _} = cert_data} ->
+              build_ssl_options(cert_data)
 
-          _error ->
-            default_cert_options()
+            _error ->
+              default_cert_options()
+          end
+        else
+          default_cert_options()
         end
     end
   catch
@@ -201,7 +205,8 @@ defmodule Varco.TLS.CertificateStore do
         {:reply, {:ok, cert_data}, state}
 
       nil ->
-        if state.auto_self_signed do
+        if state.auto_self_signed and Varco.Routing.Table.host_configured?(host) and
+             auto_certs_count() < 1000 do
           case generate_and_store_cert(state, host, [host]) do
             {:ok, new_state} ->
               cert_data = lookup_cert(host)
@@ -336,4 +341,11 @@ defmodule Varco.TLS.CertificateStore do
   end
 
   defp extract_not_after(_), do: DateTime.utc_now() |> DateTime.add(90 * 86400, :second)
+
+  defp auto_certs_count do
+    :ets.tab2list(@certs_table)
+    |> Enum.count(fn {_domain, data} -> is_map(data) and Map.get(data, :type) == :self_signed end)
+  rescue
+    _ -> 0
+  end
 end

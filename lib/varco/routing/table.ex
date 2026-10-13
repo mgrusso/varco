@@ -11,7 +11,7 @@ defmodule Varco.Routing.Table do
   alias Varco.Routing.Route
 
   @table :varco_routes
-
+  @persistent_key :varco_compiled_routes
   # Client API
 
   @doc """
@@ -74,26 +74,58 @@ defmodule Varco.Routing.Table do
   end
 
   @doc """
-  Matches an incoming request by Host and Path to the best route.
-  Returns `%Route{}` or `nil`.
+  Checks if a host matches at least one configured route, wildcard, or catch-all.
+  Runs in sub-microsecond time.
+  """
+  @spec host_configured?(String.t()) :: boolean()
+  def host_configured?(host) when is_binary(host) do
+    normalized_host = host |> String.downcase() |> clean_host_port()
+    compiled = :persistent_term.get(@persistent_key, %{exact: %{}, wildcards: [], catchall: []})
 
-  Sorting rules (most specific to least specific):
-  1. Longest matching path prefix.
-  2. Exact host match over wildcard host match.
-  3. Wildcard host match over catch-all (empty hosts).
+    Map.has_key?(compiled.exact, normalized_host) or
+      Enum.any?(compiled.wildcards, fn {suffix, _route} ->
+        case String.split(normalized_host, ".", parts: 2) do
+          [_prefix, host_suffix] when host_suffix == suffix -> true
+          _ -> false
+        end
+      end) or
+      compiled.catchall != []
+  end
+
+  def host_configured?(_), do: false
+
+  @doc """
+  Matches an incoming request by Host and Path to the best route using
+  the lock-free compiled route index. Returns `%Route{}` or `nil`.
   """
   @spec match_request(String.t(), String.t()) :: Route.t() | nil
   def match_request(host, path) when is_binary(host) and is_binary(path) do
     normalized_host = host |> String.downcase() |> clean_host_port()
-    routes = list_routes()
+    compiled = :persistent_term.get(@persistent_key, %{exact: %{}, wildcards: [], catchall: []})
 
-    routes
-    |> Enum.filter(&route_matches?(&1, normalized_host, path))
-    |> Enum.sort_by(&route_specificity(&1, normalized_host), :desc)
-    |> List.first()
+    # 1. Exact host candidates
+    exact_candidates = Map.get(compiled.exact, normalized_host, [])
+
+    # 2. Wildcard candidates matching normalized_host
+    wildcard_candidates =
+      Enum.flat_map(compiled.wildcards, fn {suffix, route} ->
+        case String.split(normalized_host, ".", parts: 2) do
+          [_prefix, host_suffix] when host_suffix == suffix -> [route]
+          _ -> []
+        end
+      end)
+
+    # 3. Match path in order of precedence: exact hosts -> wildcards -> catchall
+    find_matching_path(exact_candidates, path) ||
+      find_matching_path(wildcard_candidates, path) ||
+      find_matching_path(compiled.catchall, path)
   end
 
   def match_request(_host, _path), do: nil
+
+  defp find_matching_path(candidates, path) do
+    Enum.find(candidates, &path_match?(&1, path))
+  end
 
   # Matching Helpers
 
@@ -102,32 +134,6 @@ defmodule Varco.Routing.Table do
       [h, _port] -> h
       [h] -> h
     end
-  end
-
-  defp route_matches?(%Route{} = route, host, path) do
-    host_match?(route.hosts, host) and path_match?(route, path)
-  end
-
-  defp host_match?([], _host), do: true
-
-  defp host_match?(hosts, host) when is_list(hosts) do
-    Enum.any?(hosts, fn pattern ->
-      cond do
-        pattern == host ->
-          true
-
-        String.starts_with?(pattern, "*.") ->
-          suffix = String.replace_prefix(pattern, "*.", "")
-
-          case String.split(host, ".", parts: 2) do
-            [_prefix, host_suffix] -> host_suffix == suffix
-            _ -> false
-          end
-
-        true ->
-          false
-      end
-    end)
   end
 
   defp path_match?(%Route{path_type: :exact, path: route_path}, path) do
@@ -150,34 +156,20 @@ defmodule Varco.Routing.Table do
     end
   end
 
-  # Returns a tuple score for sorting by specificity
-  defp route_specificity(%Route{} = route, host) do
-    host_score =
-      cond do
-        route.hosts == [] -> 0
-        Enum.any?(route.hosts, &(&1 == host)) -> 2
-        true -> 1
-      end
-
-    path_length = String.length(route.path)
-
-    {path_length, host_score}
-  end
-
-  # Server Callbacks
-
   @impl true
   def init(_opts) do
     if :ets.info(@table) == :undefined do
       :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
     end
 
+    recompile_index()
     {:ok, %{}}
   end
 
   @impl true
   def handle_call({:add_route, %Route{} = route}, _from, state) do
     :ets.insert(@table, {route.id, route})
+    recompile_index()
     Logger.info("Added route #{route.id} for hosts: #{inspect(route.hosts)} path: #{route.path}")
     {:reply, {:ok, route}, state}
   end
@@ -187,6 +179,7 @@ defmodule Varco.Routing.Table do
     case :ets.lookup(@table, route_id) do
       [{^route_id, _}] ->
         :ets.delete(@table, route_id)
+        recompile_index()
         Logger.info("Removed route #{route_id}")
         {:reply, :ok, state}
 
@@ -198,6 +191,47 @@ defmodule Varco.Routing.Table do
   @impl true
   def handle_call(:clear_routes, _from, state) do
     :ets.delete_all_objects(@table)
+    recompile_index()
     {:reply, :ok, state}
+  end
+
+  defp recompile_index do
+    routes =
+      @table
+      |> :ets.tab2list()
+      |> Enum.map(fn {_id, r} -> r end)
+
+    # Pre-sort routes by path specificity (exact first, then longest path)
+    sorted = Enum.sort_by(routes, &route_specificity_score/1, :desc)
+
+    acc_init = %{exact: %{}, wildcards: [], catchall: []}
+
+    compiled =
+      Enum.reduce(sorted, acc_init, fn route, acc ->
+        if route.hosts == [] do
+          %{acc | catchall: acc.catchall ++ [route]}
+        else
+          Enum.reduce(route.hosts, acc, fn host_pattern, inner_acc ->
+            h_clean = host_pattern |> String.downcase() |> clean_host_port()
+
+            if String.starts_with?(h_clean, "*.") do
+              suffix = String.replace_prefix(h_clean, "*.", "")
+              %{inner_acc | wildcards: inner_acc.wildcards ++ [{suffix, route}]}
+            else
+              updated_exact =
+                Map.update(inner_acc.exact, h_clean, [route], fn list -> list ++ [route] end)
+
+              %{inner_acc | exact: updated_exact}
+            end
+          end)
+        end
+      end)
+
+    :persistent_term.put(@persistent_key, compiled)
+  end
+
+  defp route_specificity_score(%Route{} = route) do
+    type_score = if route.path_type == :exact, do: 1000, else: 0
+    type_score + String.length(route.path)
   end
 end
