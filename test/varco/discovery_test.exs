@@ -201,6 +201,40 @@ defmodule Varco.DiscoveryTest do
       assert route.timeout == 3_600_000
     end
 
+    test "parses nginx backend-protocol HTTPS annotation" do
+      ingress = %{
+        "metadata" => %{
+          "annotations" => %{
+            "nginx.ingress.kubernetes.io/backend-protocol" => "HTTPS"
+          }
+        },
+        "spec" => %{
+          "ingressClassName" => "varco",
+          "rules" => [
+            %{
+              "host" => "ocis.domain.tld",
+              "http" => %{
+                "paths" => [
+                  %{
+                    "path" => "/",
+                    "backend" => %{
+                      "service" => %{
+                        "name" => "ocis-svc",
+                        "port" => %{"number" => 9200}
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+
+      assert {:ok, [route]} = Kubernetes.ingress_to_routes(ingress)
+      assert route.upstreams == ["https://ocis-svc.default.svc.cluster.local:9200"]
+    end
+
     test "supports multi-class matching e.g. nginx,varco and wildcard *" do
       ingress_nginx = %{
         "spec" => %{

@@ -20,7 +20,11 @@ defmodule Varco.Application do
       # Upstream Health Checker
       Varco.Routing.HealthChecker,
       # Outgoing Finch connection pool for proxying
-      {Finch, name: Varco.Finch},
+      {Finch,
+       name: Varco.Finch,
+       pools: %{
+         :default => [conn_opts: [transport_opts: [verify: :verify_none]]]
+       }},
       # Cluster Synchronization & Node discovery
       Varco.Cluster.Sync,
       Varco.Cluster.Discovery,
