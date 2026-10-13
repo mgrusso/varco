@@ -23,11 +23,27 @@ defmodule Varco.API.Router do
 
   plug(:dispatch)
 
-  # Dashboard
+  # Dashboard & Root Redirect
+  get "/" do
+    conn
+    |> put_resp_header("location", "/dashboard")
+    |> send_resp(302, "")
+  end
+
   get "/dashboard" do
     conn
+    |> put_resp_header("access-control-allow-origin", "*")
     |> put_resp_content_type("text/html")
     |> send_resp(200, HTML.render())
+  end
+
+  # CORS Preflight
+  options _ do
+    conn
+    |> put_resp_header("access-control-allow-origin", "*")
+    |> put_resp_header("access-control-allow-methods", "GET, POST, DELETE, OPTIONS")
+    |> put_resp_header("access-control-allow-headers", "content-type, authorization")
+    |> send_resp(204, "")
   end
 
   # Health & Ping
@@ -150,6 +166,9 @@ defmodule Varco.API.Router do
 
   defp json(conn, status, data) do
     conn
+    |> put_resp_header("access-control-allow-origin", "*")
+    |> put_resp_header("access-control-allow-methods", "GET, POST, DELETE, OPTIONS")
+    |> put_resp_header("access-control-allow-headers", "content-type, authorization")
     |> put_resp_content_type("application/json")
     |> send_resp(status, Jason.encode!(data))
   end

@@ -266,6 +266,39 @@ defmodule Varco.RoutingAndProxyTest do
     assert conn.resp_body =~ "Bad Gateway"
   end
 
+  test "redirects HTTP to HTTPS for TLS routes unless x-forwarded-proto is https", %{
+    upstream_url: upstream_url
+  } do
+    {:ok, _route} =
+      Table.add_route(%{
+        id: "tls-redirect-route",
+        host: "secure.local",
+        path: "/app",
+        upstreams: [upstream_url],
+        tls: true
+      })
+
+    # Plain HTTP -> 308 redirect
+    conn_plain =
+      Plug.Test.conn(:get, "/app")
+      |> Map.put(:host, "secure.local")
+      |> Map.put(:scheme, :http)
+      |> Handler.call([])
+
+    assert conn_plain.status == 308
+    assert Plug.Conn.get_resp_header(conn_plain, "location") == ["https://secure.local/app"]
+
+    # HTTP with x-forwarded-proto: https -> no redirect, proxies to upstream
+    conn_xfp =
+      Plug.Test.conn(:get, "/app")
+      |> Map.put(:host, "secure.local")
+      |> Map.put(:scheme, :http)
+      |> Plug.Conn.put_req_header("x-forwarded-proto", "https")
+      |> Handler.call([])
+
+    assert conn_xfp.status == 200
+  end
+
   test "end-to-end WebSocket proxying with bidirectional message and control frames", %{
     upstream_url: upstream_url,
     proxy_port: proxy_port
