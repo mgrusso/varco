@@ -2,8 +2,18 @@ defmodule Varco.Dashboard.HTML do
   @moduledoc """
   Generates the zero-dependency, embedded real-time dashboard HTML.
   """
+  alias Varco.Routing.Table
+  alias Varco.TLS.CertificateStore
 
   def render do
+    mem_mb = (:erlang.memory(:total) / 1024 / 1024) |> Float.round(1)
+    routes = Table.list_routes()
+    certs = CertificateStore.list_certificates()
+    current_node = Node.self()
+    nodes_count = length(Node.list()) + 1
+    routes_rows = render_initial_routes(routes)
+    certs_rows = render_initial_certs(certs)
+
     """
     <!DOCTYPE html>
     <html lang="en">
@@ -71,7 +81,7 @@ defmodule Varco.Dashboard.HTML do
           <div class="header-meta">
             <div class="node-chip">
               <div class="dot" id="node-dot"></div>
-              <span id="node-name">Connecting...</span>
+              <span id="node-name">#{current_node}</span>
             </div>
             <a href="/api/v1/certificates/ca" class="btn-ca" download="varco-root-ca.crt">Export Root CA</a>
           </div>
@@ -80,19 +90,19 @@ defmodule Varco.Dashboard.HTML do
         <div class="stats-grid">
           <div class="stat-card">
             <div class="stat-label">Active Routes</div>
-            <div class="stat-val" id="stat-routes">--</div>
+            <div class="stat-val" id="stat-routes">#{length(routes)}</div>
           </div>
           <div class="stat-card">
             <div class="stat-label">TLS Certificates</div>
-            <div class="stat-val" id="stat-certs">--</div>
+            <div class="stat-val" id="stat-certs">#{length(certs)}</div>
           </div>
           <div class="stat-card">
             <div class="stat-label">Cluster Nodes</div>
-            <div class="stat-val" id="stat-nodes">--</div>
+            <div class="stat-val" id="stat-nodes">#{nodes_count}</div>
           </div>
           <div class="stat-card">
             <div class="stat-label">BEAM Memory</div>
-            <div class="stat-val" id="stat-mem">-- MB</div>
+            <div class="stat-val" id="stat-mem">#{mem_mb} MB</div>
           </div>
         </div>
 
@@ -112,7 +122,7 @@ defmodule Varco.Dashboard.HTML do
               </tr>
             </thead>
             <tbody id="routes-table">
-              <tr><td colspan="6" style="text-align:center; color: var(--muted);">Loading routes...</td></tr>
+              #{routes_rows}
             </tbody>
           </table>
         </div>
@@ -131,7 +141,7 @@ defmodule Varco.Dashboard.HTML do
               </tr>
             </thead>
             <tbody id="certs-table">
-              <tr><td colspan="4" style="text-align:center; color: var(--muted);">Loading certificates...</td></tr>
+              #{certs_rows}
             </tbody>
           </table>
         </div>
@@ -272,5 +282,98 @@ defmodule Varco.Dashboard.HTML do
     </body>
     </html>
     """
+  end
+
+  defp render_initial_routes([]) do
+    ~s"""
+    <tr><td colspan="6" style="text-align:center; color: var(--muted);">No routes configured yet. Add routes via REST API, Docker labels, or Kubernetes Ingress.</td></tr>
+    """
+  end
+
+  defp render_initial_routes(routes) do
+    Enum.map_join(routes, "\n", fn r ->
+      hosts =
+        if r.hosts != [] do
+          Enum.map_join(r.hosts, " ", &"<code>#{Plug.HTML.html_escape(&1)}</code>")
+        else
+          "<em>(any host)</em>"
+        end
+
+      upstreams =
+        if r.upstreams != [] do
+          Enum.map_join(r.upstreams, "<br>", &"<code>#{Plug.HTML.html_escape(&1)}</code>")
+        else
+          "<em>(no upstreams)</em>"
+        end
+
+      tls_badge =
+        if r.tls do
+          "<span class=\"badge badge-tls\">HTTPS / TLS</span>"
+        else
+          "<span class=\"badge badge-plain\">Plain HTTP</span>"
+        end
+
+      "<tr>" <>
+        "<td><strong>" <>
+        Plug.HTML.html_escape(r.id) <>
+        "</strong></td>" <>
+        "<td>" <>
+        hosts <>
+        "</td>" <>
+        "<td><code>" <>
+        Plug.HTML.html_escape(r.path) <>
+        "</code></td>" <>
+        "<td>" <>
+        upstreams <>
+        "</td>" <>
+        "<td>" <>
+        tls_badge <>
+        "</td>" <>
+        "<td>" <>
+        Plug.HTML.html_escape(to_string(r.load_balancer)) <>
+        "</td></tr>"
+    end)
+  end
+
+  defp render_initial_certs([]) do
+    ~s"""
+    <tr><td colspan="4" style="text-align:center; color: var(--muted);">No certificates loaded.</td></tr>
+    """
+  end
+
+  defp render_initial_certs(certs) do
+    Enum.map_join(certs, "\n", fn c ->
+      domains =
+        if c.domains && c.domains != [] do
+          Enum.map_join(c.domains, ", ", &Plug.HTML.html_escape(&1))
+        else
+          "-"
+        end
+
+      badge_class = if c.type == :self_signed, do: "badge-self", else: "badge-custom"
+
+      expires =
+        if c.expires_at do
+          DateTime.to_date(c.expires_at) |> Date.to_iso8601()
+        else
+          "N/A"
+        end
+
+      "<tr>" <>
+        "<td><strong>" <>
+        Plug.HTML.html_escape(c.domain) <>
+        "</strong></td>" <>
+        "<td><span class=\"badge " <>
+        badge_class <>
+        "\">" <>
+        Plug.HTML.html_escape(to_string(c.type)) <>
+        "</span></td>" <>
+        "<td>" <>
+        domains <>
+        "</td>" <>
+        "<td>" <>
+        expires <>
+        "</td></tr>"
+    end)
   end
 end
