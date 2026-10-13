@@ -101,7 +101,7 @@ defmodule Varco.Routing.HealthChecker do
   defp probe_upstream(upstream_url) do
     uri = URI.parse(upstream_url)
     host = uri.host || "127.0.0.1"
-    port = uri.port || (if uri.scheme == "https", do: 443, else: 80)
+    port = uri.port || if uri.scheme == "https", do: 443, else: 80
 
     # Fast TCP probe with 1.5s timeout
     case :gen_tcp.connect(String.to_charlist(host), port, [:binary, active: false], 1500) do

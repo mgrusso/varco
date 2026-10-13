@@ -129,6 +129,182 @@ defmodule Varco.DiscoveryTest do
 
       assert Kubernetes.ingress_to_routes(ingress) == :ignore
     end
+
+    test "parses annotations for timeouts and named service ports" do
+      ingress = %{
+        "metadata" => %{
+          "name" => "timeout-ingress",
+          "namespace" => "default",
+          "annotations" => %{
+            "varco.io/proxy-timeout" => "600000"
+          }
+        },
+        "spec" => %{
+          "ingressClassName" => "varco",
+          "rules" => [
+            %{
+              "host" => "timeout.domain.tld",
+              "http" => %{
+                "paths" => [
+                  %{
+                    "path" => "/upload",
+                    "backend" => %{
+                      "service" => %{
+                        "name" => "upload-svc",
+                        "port" => %{"name" => "http"}
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+
+      assert {:ok, [route]} = Kubernetes.ingress_to_routes(ingress)
+      assert route.timeout == 600_000
+      assert route.upstreams == ["http://upload-svc.default.svc.cluster.local:80"]
+    end
+
+    test "extracts TLS secret references from Ingress spec" do
+      ingress = %{
+        "metadata" => %{"namespace" => "staging"},
+        "spec" => %{
+          "tls" => [
+            %{"hosts" => ["app.staging.tld"], "secretName" => "app-cert-secret"},
+            %{"hosts" => ["api.staging.tld"]}
+          ]
+        }
+      }
+
+      secrets = Kubernetes.extract_tls_secrets(ingress)
+      assert length(secrets) == 1
+
+      assert List.first(secrets) == %{
+               namespace: "staging",
+               secret_name: "app-cert-secret",
+               hosts: ["app.staging.tld"]
+             }
+    end
+
+    test "synchronizes Ingresses from K8s API and loads cert-manager TLS Secrets" do
+      alias Varco.TLS.{CA, CertificateStore}
+
+      {:ok, {ca_cert, ca_key}} = CA.generate_root_ca()
+      {:ok, {srv_cert, srv_key}} = CA.issue_server_cert(ca_cert, ca_key, "k8s-synced.example.com")
+      cert_pem = CA.to_pem(srv_cert)
+      key_pem = CA.to_pem(srv_key)
+
+      ingress_data = %{
+        "apiVersion" => "networking.k8s.io/v1",
+        "kind" => "IngressList",
+        "items" => [
+          %{
+            "apiVersion" => "networking.k8s.io/v1",
+            "kind" => "Ingress",
+            "metadata" => %{
+              "name" => "web-ingress",
+              "namespace" => "production"
+            },
+            "spec" => %{
+              "ingressClassName" => "varco",
+              "tls" => [
+                %{
+                  "hosts" => ["k8s-synced.example.com"],
+                  "secretName" => "web-tls-secret"
+                }
+              ],
+              "rules" => [
+                %{
+                  "host" => "k8s-synced.example.com",
+                  "http" => %{
+                    "paths" => [
+                      %{
+                        "path" => "/app",
+                        "backend" => %{
+                          "service" => %{
+                            "name" => "web-service",
+                            "port" => %{"number" => 8080}
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+
+      secret_data = %{
+        "apiVersion" => "v1",
+        "kind" => "Secret",
+        "type" => "kubernetes.io/tls",
+        "metadata" => %{
+          "name" => "web-tls-secret",
+          "namespace" => "production"
+        },
+        "data" => %{
+          "tls.crt" => Base.encode64(cert_pem),
+          "tls.key" => Base.encode64(key_pem)
+        }
+      }
+
+      # Mock K8s API server using Bandit
+      {:ok, k8s_mock} =
+        Bandit.start_link(
+          plug: fn conn, _opts ->
+            case conn.request_path do
+              "/apis/networking.k8s.io/v1/ingresses" ->
+                conn
+                |> Plug.Conn.put_resp_content_type("application/json")
+                |> Plug.Conn.send_resp(200, Jason.encode!(ingress_data))
+
+              "/api/v1/namespaces/production/secrets/web-tls-secret" ->
+                conn
+                |> Plug.Conn.put_resp_content_type("application/json")
+                |> Plug.Conn.send_resp(200, Jason.encode!(secret_data))
+
+              _ ->
+                conn |> Plug.Conn.send_resp(404, "Not Found")
+            end
+          end,
+          port: 0
+        )
+
+      listener = ThousandIsland.Server.listener_pid(k8s_mock)
+      {_, mock_port} = ThousandIsland.Listener.listener_info(listener)
+
+      sync_state = %{
+        enabled: true,
+        api_url: "http://127.0.0.1:#{mock_port}",
+        token: "mock-k8s-bearer-token",
+        ca_cert_path: nil,
+        insecure_skip_tls_verify: true,
+        ingress_class: "varco",
+        interval: 10_000,
+        last_sync: nil,
+        last_error: nil
+      }
+
+      assert {:ok, result, _new_state} = Kubernetes.perform_sync(sync_state)
+      assert result.routes_count == 1
+      assert result.tls_secrets_count == 1
+
+      # Verify route was installed in Table
+      route = Table.match_request("k8s-synced.example.com", "/app")
+      assert route != nil
+      assert route.id == "k8s-production-web-ingress-r0-p0"
+      assert route.upstreams == ["http://web-service.production.svc.cluster.local:8080"]
+
+      # Verify TLS secret was installed in CertificateStore
+      cert_info = CertificateStore.lookup_cert("k8s-synced.example.com")
+      assert cert_info != nil
+      assert "k8s-synced.example.com" in cert_info.domains
+      assert cert_info.type == :custom
+    end
   end
 
   describe "Static File / String Discovery" do

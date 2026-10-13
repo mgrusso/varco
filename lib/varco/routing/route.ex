@@ -17,6 +17,7 @@ defmodule Varco.Routing.Route do
             load_balancer: :round_robin,
             request_headers: [],
             response_headers: [],
+            timeout: 300_000,
             metadata: %{}
 
   @type t :: %__MODULE__{
@@ -30,6 +31,7 @@ defmodule Varco.Routing.Route do
           load_balancer: :round_robin | :random,
           request_headers: [{String.t(), String.t()}],
           response_headers: [{String.t(), String.t()}],
+          timeout: pos_integer() | :infinity,
           metadata: map()
         }
 
@@ -45,10 +47,10 @@ defmodule Varco.Routing.Route do
     upstreams =
       get_list(attrs, :upstreams) ||
         get_list(attrs, "upstreams") ||
-        (case get_string(attrs, :upstream) || get_string(attrs, "upstream") do
-           nil -> []
-           single -> [single]
-         end)
+        case get_string(attrs, :upstream) || get_string(attrs, "upstream") do
+          nil -> []
+          single -> [single]
+        end
 
     if upstreams == [] do
       {:error, :missing_upstreams}
@@ -74,6 +76,27 @@ defmodule Varco.Routing.Route do
           _ -> :round_robin
         end
 
+      timeout =
+        case get_val(attrs, :timeout) || get_val(attrs, "timeout") do
+          :infinity ->
+            :infinity
+
+          "infinity" ->
+            :infinity
+
+          int when is_integer(int) and int > 0 ->
+            int
+
+          bin when is_binary(bin) ->
+            case Integer.parse(bin) do
+              {val, ""} when val > 0 -> val
+              _ -> 300_000
+            end
+
+          _ ->
+            300_000
+        end
+
       normalized_upstreams = Enum.map(upstreams, &normalize_upstream_url/1)
 
       route = %__MODULE__{
@@ -87,6 +110,7 @@ defmodule Varco.Routing.Route do
         load_balancer: load_balancer,
         request_headers: get_headers(attrs, :request_headers),
         response_headers: get_headers(attrs, :response_headers),
+        timeout: timeout,
         metadata: get_map(attrs, :metadata)
       }
 
@@ -98,10 +122,10 @@ defmodule Varco.Routing.Route do
     raw =
       get_list(attrs, :hosts) ||
         get_list(attrs, "hosts") ||
-        (case get_string(attrs, :host) || get_string(attrs, "host") do
-           nil -> []
-           single -> [single]
-         end)
+        case get_string(attrs, :host) || get_string(attrs, "host") do
+          nil -> []
+          single -> [single]
+        end
 
     raw
     |> Enum.map(&String.downcase(to_string(&1)))

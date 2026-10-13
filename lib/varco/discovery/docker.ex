@@ -70,13 +70,18 @@ defmodule Varco.Discovery.Docker do
       ip = detect_container_ip(container)
 
       if port == nil do
-        Logger.warning("Docker container #{container_name} enabled for Varco but has no detectable IP or port")
+        Logger.warning(
+          "Docker container #{container_name} enabled for Varco but has no detectable IP or port"
+        )
+
         :ignore
       else
         path = Map.get(labels, "varco.path", "/")
         strip_path = Map.get(labels, "varco.strip_path", "false") == "true"
         tls = Map.get(labels, "varco.tls", "true") != "false"
-        lb = if Map.get(labels, "varco.load_balancer") == "random", do: :random, else: :round_robin
+
+        lb =
+          if Map.get(labels, "varco.load_balancer") == "random", do: :random, else: :round_robin
 
         scheme = Map.get(labels, "varco.scheme", "http")
         upstream_url = "#{scheme}://#{ip}:#{port}"

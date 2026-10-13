@@ -60,9 +60,12 @@ defmodule Varco.Application do
   rescue
     _ -> true
   end
+
   defp get_env_int(key, default) do
     case System.get_env(key) do
-      nil -> default
+      nil ->
+        default
+
       val ->
         case Integer.parse(val) do
           {num, ""} -> num

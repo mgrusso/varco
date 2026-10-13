@@ -3,7 +3,7 @@ ARG ELIXIR_VERSION=1.18.2
 ARG ERLANG_VERSION=27.2.4
 ARG ALPINE_VERSION=3.21.3
 
-FROM hexpm/elixir:${ELIXIR_VERSION}-erlang-${ERLANG_VERSION}-alpine-${ALPINE_VERSION} AS builder
+FROM docker.io/hexpm/elixir:${ELIXIR_VERSION}-erlang-${ERLANG_VERSION}-alpine-${ALPINE_VERSION} AS builder
 
 # Install build dependencies
 RUN apk add --no-cache build-base git
@@ -30,7 +30,7 @@ RUN mix compile
 RUN mix release
 
 # Stage 2: Minimal runtime image
-FROM alpine:${ALPINE_VERSION} AS runner
+FROM docker.io/library/alpine:${ALPINE_VERSION} AS runner
 
 RUN apk add --no-cache \
     libstdc++ \

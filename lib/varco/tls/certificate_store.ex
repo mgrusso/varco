@@ -39,14 +39,14 @@ defmodule Varco.TLS.CertificateStore do
   """
   def resolve_sni(host) when is_binary(host) do
     case lookup_cert(host) do
-      %{der_cert: der_cert, der_key: der_key, key_format: key_format} ->
-        [cert: der_cert, key: {key_format, der_key}]
+      %{der_cert: _} = cert_data ->
+        build_ssl_options(cert_data)
 
       nil ->
         # On-demand generation via GenServer (atomic & thread-safe)
         case GenServer.call(__MODULE__, {:ensure_certificate, host}, 5000) do
-          {:ok, %{der_cert: der_cert, der_key: der_key, key_format: key_format}} ->
-            [cert: der_cert, key: {key_format, der_key}]
+          {:ok, %{der_cert: _} = cert_data} ->
+            build_ssl_options(cert_data)
 
           _error ->
             default_cert_options()
@@ -63,8 +63,8 @@ defmodule Varco.TLS.CertificateStore do
   """
   def default_cert_options do
     case lookup_cert("__default__") do
-      %{der_cert: der_cert, der_key: der_key, key_format: key_format} ->
-        [cert: der_cert, key: {key_format, der_key}]
+      %{der_cert: _} = cert_data ->
+        build_ssl_options(cert_data)
 
       _ ->
         []
@@ -227,14 +227,26 @@ defmodule Varco.TLS.CertificateStore do
           CA.extract_domains(cert)
         end
 
-      der_cert = X509.Certificate.to_der(cert)
-      der_key = X509.PrivateKey.to_der(key)
+      all_der_certs = CA.cert_chain_from_pem(cert_pem)
+
+      {der_cert, chain} =
+        case all_der_certs do
+          [leaf | intermediates] -> {leaf, intermediates}
+          [] -> {X509.Certificate.to_der(cert), []}
+        end
+
+      der_key =
+        try do
+          X509.PrivateKey.to_der(key)
+        rescue
+          _ -> :public_key.der_encode(elem(key, 0), key)
+        end
 
       key_format =
-        case key do
-          {:ECPrivateKey, _} -> :ECPrivateKey
-          {:RSAPrivateKey, _} -> :RSAPrivateKey
-          _ -> :ECPrivateKey
+        case elem(key, 0) do
+          :RSAPrivateKey -> :RSAPrivateKey
+          :ECPrivateKey -> :ECPrivateKey
+          other -> other
         end
 
       validity = X509.Certificate.validity(cert)
@@ -244,6 +256,7 @@ defmodule Varco.TLS.CertificateStore do
         domains: domains,
         der_cert: der_cert,
         der_key: der_key,
+        chain: chain,
         key_format: key_format,
         type: :custom,
         inserted_at: DateTime.utc_now(),
@@ -301,6 +314,17 @@ defmodule Varco.TLS.CertificateStore do
       {:error, reason} ->
         Logger.error("Failed to issue server certificate: #{inspect(reason)}")
         {:error, reason}
+    end
+  end
+
+  defp build_ssl_options(
+         %{der_cert: der_cert, der_key: der_key, key_format: key_format} = cert_data
+       ) do
+    opts = [cert: der_cert, key: {key_format, der_key}]
+
+    case Map.get(cert_data, :chain, []) do
+      [_ | _] = chain -> opts ++ [cacerts: chain]
+      _ -> opts
     end
   end
 

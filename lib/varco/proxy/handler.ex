@@ -68,7 +68,11 @@ defmodule Varco.Proxy.Handler do
         if should_redirect_to_https?(conn, route) do
           redirect_to_https(conn, host)
         else
-          proxy_request(conn, route, start_time)
+          if websocket_upgrade?(conn) do
+            proxy_websocket(conn, route, start_time)
+          else
+            proxy_request(conn, route, start_time)
+          end
         end
     end
   end
@@ -90,6 +94,167 @@ defmodule Varco.Proxy.Handler do
     end
   end
 
+  defp proxy_websocket(conn, route, start_time) do
+    case LoadBalancer.select_upstream(route) do
+      {:ok, upstream} ->
+        forward_websocket_to_upstream(conn, route, upstream, start_time)
+
+      {:error, :no_upstreams} ->
+        emit_telemetry(start_time, conn, 502, route.id, nil)
+
+        conn
+        |> put_resp_content_type("text/plain")
+        |> send_resp(502, "Bad Gateway: No upstreams available for route #{route.id}")
+        |> halt()
+    end
+  end
+
+  defp forward_websocket_to_upstream(conn, route, upstream, start_time) do
+    upstream_uri = URI.parse(upstream)
+
+    {conn_scheme, ws_scheme, default_port} =
+      case upstream_uri.scheme do
+        "https" -> {:https, :wss, 443}
+        "wss" -> {:https, :wss, 443}
+        _ -> {:http, :ws, 80}
+      end
+
+    port = upstream_uri.port || default_port
+    host = upstream_uri.host || "127.0.0.1"
+
+    target_path = calculate_target_path(conn.request_path, route)
+    base_path = upstream_uri.path || ""
+
+    full_path =
+      if base_path in ["", "/"], do: target_path, else: Path.join(base_path, target_path)
+
+    query_str = if conn.query_string != "", do: "?" <> conn.query_string, else: ""
+    upstream_path = full_path <> query_str
+
+    headers = prepare_websocket_upstream_headers(conn, route, host, port)
+
+    subprotocols =
+      case get_req_header(conn, "sec-websocket-protocol") do
+        [proto | _] -> String.split(proto, ",") |> Enum.map(&String.trim/1)
+        [] -> []
+      end
+
+    upgrade_opts = if subprotocols != [], do: [subprotocols: subprotocols], else: []
+
+    connect_opts =
+      if conn_scheme == :https do
+        [transport_opts: [verify: :verify_none]]
+      else
+        []
+      end
+
+    timeout = route.timeout || 300_000
+
+    with {:ok, mint_conn} <- Mint.HTTP.connect(conn_scheme, host, port, connect_opts),
+         {:ok, mint_conn, ref} <-
+           Mint.WebSocket.upgrade(ws_scheme, mint_conn, upstream_path, headers, upgrade_opts) do
+      case await_websocket_upgrade(mint_conn, ref, timeout) do
+        {:ok, mint_conn, 101, resp_headers} ->
+          {:ok, mint_conn, ws} = Mint.WebSocket.new(mint_conn, ref, 101, resp_headers)
+
+          resp_subproto =
+            case List.keyfind(resp_headers, "sec-websocket-protocol", 0) do
+              {_, val} -> val
+              nil -> nil
+            end
+
+          conn =
+            if resp_subproto do
+              put_resp_header(conn, "sec-websocket-protocol", resp_subproto)
+            else
+              conn
+            end
+
+          conn =
+            Enum.reduce(route.response_headers, conn, fn {k, v}, c ->
+              put_resp_header(c, String.downcase(k), v)
+            end)
+
+          emit_telemetry(start_time, conn, 101, route.id, upstream, 0)
+
+          Plug.Conn.upgrade_adapter(
+            conn,
+            :websocket,
+            {Varco.Proxy.WebSocketHandler,
+             %{
+               conn: mint_conn,
+               ref: ref,
+               ws: ws,
+               route_id: route.id,
+               upstream: upstream
+             }, []}
+          )
+
+        {:ok, mint_conn, status, _resp_headers} ->
+          Mint.HTTP.close(mint_conn)
+          emit_telemetry(start_time, conn, status, route.id, upstream, 0)
+
+          conn
+          |> put_resp_content_type("text/plain")
+          |> send_resp(status, "Upstream rejected WebSocket upgrade with status #{status}")
+          |> halt()
+
+        {:error, reason} ->
+          Mint.HTTP.close(mint_conn)
+
+          Logger.error(
+            "Failed to upgrade WebSocket with upstream (#{upstream}): #{inspect(reason)}"
+          )
+
+          emit_telemetry(start_time, conn, 502, route.id, upstream, 0)
+
+          conn
+          |> put_resp_content_type("text/plain")
+          |> send_resp(502, "Bad Gateway: Upstream WebSocket upgrade failed")
+          |> halt()
+      end
+    else
+      {:error, reason} ->
+        Logger.error("Failed to connect to upstream WebSocket (#{upstream}): #{inspect(reason)}")
+        emit_telemetry(start_time, conn, 502, route.id, upstream, 0)
+
+        conn
+        |> put_resp_content_type("text/plain")
+        |> send_resp(502, "Bad Gateway: Upstream connection failed")
+        |> halt()
+    end
+  end
+
+  defp await_websocket_upgrade(mint_conn, ref, timeout, acc_status \\ nil, acc_headers \\ []) do
+    receive do
+      message ->
+        case Mint.WebSocket.stream(mint_conn, message) do
+          {:ok, mint_conn, entries} ->
+            {status, headers} =
+              Enum.reduce(entries, {acc_status, acc_headers}, fn
+                {:status, ^ref, s}, {_, h} -> {s, h}
+                {:headers, ^ref, h}, {s, existing_h} -> {s, existing_h ++ h}
+                _other, acc -> acc
+              end)
+
+            if status != nil and headers != [] do
+              {:ok, mint_conn, status, headers}
+            else
+              await_websocket_upgrade(mint_conn, ref, timeout, status, headers)
+            end
+
+          {:error, _mint_conn, reason, _} ->
+            {:error, reason}
+
+          :unknown ->
+            await_websocket_upgrade(mint_conn, ref, timeout, acc_status, acc_headers)
+        end
+    after
+      timeout ->
+        {:error, :timeout}
+    end
+  end
+
   defp forward_to_upstream(conn, route, upstream, start_time) do
     # Prepare target URL and path
     target_path = calculate_target_path(conn.request_path, route)
@@ -100,9 +265,9 @@ defmodule Varco.Proxy.Handler do
     # Prepare Headers
     headers = prepare_upstream_headers(conn, route)
 
-    # Read client request body if present
-    {:ok, body, conn} = read_client_body(conn)
-
+    # Prepare streaming request body (zero buffering in RAM)
+    timeout = route.timeout || 300_000
+    body = build_request_body(conn, timeout)
     method = String.to_atom(String.downcase(conn.method))
     finch_name = Varco.Finch
 
@@ -151,15 +316,42 @@ defmodule Varco.Proxy.Handler do
                 acc
             end
         end,
-        receive_timeout: 30_000
+        receive_timeout: timeout,
+        request_timeout: timeout
       )
 
     case result do
       {:ok, %{conn: completed_conn, status: status, bytes: bytes}} ->
+        completed_conn =
+          case Process.delete(:varco_last_conn) do
+            %Plug.Conn{adapter: updated_adapter} ->
+              %{completed_conn | adapter: updated_adapter}
+
+            _ ->
+              completed_conn
+          end
+
         emit_telemetry(start_time, completed_conn, status, route.id, upstream, bytes)
         halt(completed_conn)
 
+      {:error, reason, %{conn: error_conn, started: false}} ->
+        Process.delete(:varco_last_conn)
+        Logger.error("Upstream connection error (#{upstream}): #{inspect(reason)}")
+        emit_telemetry(start_time, error_conn, 502, route.id, upstream, 0)
+
+        error_conn
+        |> put_resp_content_type("text/plain")
+        |> send_resp(502, "Bad Gateway: Upstream connection failed")
+        |> halt()
+
+      {:error, reason, %{conn: error_conn, started: true}} ->
+        Process.delete(:varco_last_conn)
+        Logger.error("Upstream connection error mid-stream (#{upstream}): #{inspect(reason)}")
+        emit_telemetry(start_time, error_conn, 502, route.id, upstream, 0)
+        halt(error_conn)
+
       {:error, reason} ->
+        Process.delete(:varco_last_conn)
         Logger.error("Upstream connection error (#{upstream}): #{inspect(reason)}")
         emit_telemetry(start_time, conn, 502, route.id, upstream, 0)
 
@@ -244,26 +436,131 @@ defmodule Varco.Proxy.Handler do
     end)
   end
 
-  defp read_client_body(conn) do
-    case read_body(conn, length: 10_000_000, read_length: 1_000_000) do
-      {:ok, body, conn} -> {:ok, body, conn}
-      {:more, chunk, conn} -> read_more_body(conn, [chunk])
-      {:error, reason} -> {:error, reason, conn}
+  defp build_request_body(conn, timeout) do
+    if has_request_body?(conn) do
+      {:stream, stream_request_body(conn, timeout)}
+    else
+      nil
     end
   end
 
-  defp read_more_body(conn, acc) do
-    case read_body(conn, length: 10_000_000, read_length: 1_000_000) do
-      {:ok, chunk, conn} ->
-        full = IO.iodata_to_binary(Enum.reverse([chunk | acc]))
-        {:ok, full, conn}
+  defp has_request_body?(conn) do
+    cond do
+      match?({Plug.Adapters.Test.Conn, body} when body not in ["", nil], conn.adapter) ->
+        true
 
-      {:more, chunk, conn} ->
-        read_more_body(conn, [chunk | acc])
+      conn.method in ["GET", "HEAD"] and get_req_header(conn, "content-length") in [[], ["0"]] and
+          get_req_header(conn, "transfer-encoding") == [] ->
+        false
 
-      {:error, reason} ->
-        {:error, reason, conn}
+      get_req_header(conn, "content-length") not in [[], ["0"]] ->
+        true
+
+      get_req_header(conn, "transfer-encoding") != [] ->
+        true
+
+      true ->
+        false
     end
+  end
+
+  defp stream_request_body(conn, timeout) do
+    chunk_size = 64 * 1024
+
+    Stream.resource(
+      fn -> {:continue, conn} end,
+      fn
+        {:continue, c} ->
+          case read_body(c, length: chunk_size, read_length: chunk_size, read_timeout: timeout) do
+            {:ok, "", next_c} ->
+              Process.put(:varco_last_conn, next_c)
+              {:halt, {:done, next_c}}
+
+            {:ok, chunk, next_c} ->
+              Process.put(:varco_last_conn, next_c)
+              {[chunk], {:done, next_c}}
+
+            {:more, chunk, next_c} ->
+              Process.put(:varco_last_conn, next_c)
+              {[chunk], {:continue, next_c}}
+
+            {:error, _reason} ->
+              {:halt, {:done, c}}
+          end
+
+        {:done, _c} ->
+          {:halt, :done}
+      end,
+      fn _ -> :ok end
+    )
+  end
+
+  defp websocket_upgrade?(conn) do
+    conn.method == "GET" and
+      header_has_token?(conn, "connection", "upgrade") and
+      header_has_token?(conn, "upgrade", "websocket")
+  end
+
+  defp header_has_token?(conn, header_name, token) do
+    case get_req_header(conn, header_name) do
+      [] ->
+        false
+
+      headers ->
+        token_down = String.downcase(token)
+
+        Enum.any?(headers, fn value ->
+          value
+          |> String.downcase()
+          |> String.split(",")
+          |> Enum.map(&String.trim/1)
+          |> Enum.member?(token_down)
+        end)
+    end
+  end
+
+  defp prepare_websocket_upstream_headers(conn, route, host, port) do
+    client_ip =
+      conn.remote_ip
+      |> :inet.ntoa()
+      |> to_string()
+
+    excluded = [
+      "connection",
+      "upgrade",
+      "keep-alive",
+      "proxy-authenticate",
+      "proxy-authorization",
+      "te",
+      "trailers",
+      "transfer-encoding",
+      "sec-websocket-key",
+      "sec-websocket-version",
+      "sec-websocket-extensions",
+      "host"
+    ]
+
+    headers =
+      conn.req_headers
+      |> Enum.reject(fn {k, _v} -> String.downcase(k) in excluded end)
+
+    existing_xff =
+      case List.keyfind(headers, "x-forwarded-for", 0) do
+        {_, val} -> val <> ", " <> client_ip
+        nil -> client_ip
+      end
+
+    headers =
+      headers
+      |> List.keystore("host", 0, {"host", "#{host}:#{port}"})
+      |> List.keystore("x-forwarded-for", 0, {"x-forwarded-for", existing_xff})
+      |> List.keystore("x-forwarded-proto", 0, {"x-forwarded-proto", to_string(conn.scheme)})
+      |> List.keystore("x-forwarded-host", 0, {"x-forwarded-host", get_request_host(conn)})
+      |> List.keystore("x-real-ip", 0, {"x-real-ip", client_ip})
+
+    Enum.reduce(route.request_headers, headers, fn {k, v}, acc ->
+      List.keystore(acc, String.downcase(k), 0, {String.downcase(k), v})
+    end)
   end
 
   defp render_not_found(conn, host, path) do

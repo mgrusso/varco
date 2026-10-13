@@ -79,12 +79,18 @@ spec:
 * `varco.io/strip-path`: `"true"` or `"false"` (default: `"false"`)
 * `varco.io/load-balancer`: `"round_robin"` or `"random"` (default: `"round_robin"`)
 * `varco.io/upstream-scheme`: `"http"` or `"https"` (default: `"http"`)
+* `varco.io/proxy-timeout` or `varco.io/timeout`: Timeout in milliseconds or `"infinity"` (default: `300000`)
+
+### Automatic API Sync & cert-manager Integration
+When running inside a Kubernetes cluster (or configured via `KUBERNETES_API_URL` and `KUBERNETES_TOKEN`), Varco's `Varco.Discovery.Kubernetes` automatically:
+1. Polls `/apis/networking.k8s.io/v1/ingresses` for Ingress resources matching `ingressClassName: varco`.
+2. Synchronizes discovered routes dynamically into Varco's lock-free routing table, removing stale routes on Ingress deletion.
+3. Reads any referenced TLS secrets (`spec.tls[*].secretName`) from `/api/v1/namespaces/{namespace}/secrets/{secret_name}`. Decodes `tls.crt` and `tls.key` (supporting Let's Encrypt certificates managed by cert-manager) and installs them in `Varco.TLS.CertificateStore`.
 
 Varco resolves upstream service endpoints using cluster-internal DNS:
 ```text
 http://customer-service.production.svc.cluster.local:8080
 ```
-
 ---
 
 ## 3. Static File Configuration

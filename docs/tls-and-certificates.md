@@ -80,3 +80,14 @@ curl -X POST http://localhost:9000/api/v1/certificates \
 ```
 
 Varco extracts all Subject Alternative Names (SANs) and the Common Name (CN) from the certificate and hot-loads it into ETS. Future TLS handshakes matching those hostnames or wildcards will immediately use your custom certificate without restarting the server.
+
+---
+
+## 4. cert-manager & Kubernetes TLS Secrets
+
+In Kubernetes clusters where [cert-manager](https://cert-manager.io/) provisions TLS certificates (e.g. from Let's Encrypt), certificates are stored as Kubernetes Secrets of type `kubernetes.io/tls`.
+
+Varco seamlessly synchronizes with these secrets:
+* **Fullchain PEMs:** Both leaf certificates and intermediate CA certificate chains are extracted and served via dynamic SNI with `cacerts`.
+* **Private Key Formats:** Supports PKCS#1 (RSA), PKCS#8 (RSA/ECDSA), and SEC1 (EC) private keys.
+* **Automatic Renewal:** When cert-manager rotates or renews a certificate secret, Varco's Ingress synchronization picks up the new certificate and immediately updates the active TLS certificate store with zero downtime.

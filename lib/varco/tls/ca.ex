@@ -65,8 +65,7 @@ defmodule Varco.TLS.CA do
       subject_alt_name: X509.Certificate.Extension.subject_alt_name(san_list),
       basic_constraints: X509.Certificate.Extension.basic_constraints(false),
       key_usage: X509.Certificate.Extension.key_usage([:digitalSignature, :keyEncipherment]),
-      ext_key_usage:
-        X509.Certificate.Extension.ext_key_usage([:serverAuth, :clientAuth])
+      ext_key_usage: X509.Certificate.Extension.ext_key_usage([:serverAuth, :clientAuth])
     ]
 
     server_cert =
@@ -102,13 +101,41 @@ defmodule Varco.TLS.CA do
   end
 
   @doc """
-  Converts a PEM private key string into an X509.PrivateKey struct.
+  Converts a PEM private key string into an X509.PrivateKey struct or Erlang key record.
+  Supports PKCS#1 (RSA), SEC1 (EC), and PKCS#8 (unencrypted).
   """
   @spec key_from_pem(String.t()) :: {:ok, term()} | {:error, term()}
-  def key_from_pem(pem_binary) do
+  def key_from_pem(pem_binary) when is_binary(pem_binary) do
     case X509.PrivateKey.from_pem(pem_binary) do
-      {:ok, key} -> {:ok, key}
-      _ -> {:error, :invalid_pem_key}
+      {:ok, key} ->
+        {:ok, key}
+
+      _ ->
+        case :public_key.pem_decode(pem_binary) do
+          [entry | _] ->
+            try do
+              {:ok, :public_key.pem_entry_decode(entry)}
+            rescue
+              _ -> {:error, :invalid_pem_key}
+            end
+
+          _ ->
+            {:error, :invalid_pem_key}
+        end
+    end
+  end
+
+  @doc """
+  Extracts all certificate DER binaries from a PEM bundle (leaf + intermediates).
+  """
+  @spec cert_chain_from_pem(String.t()) :: [binary()]
+  def cert_chain_from_pem(pem_binary) when is_binary(pem_binary) do
+    case :public_key.pem_decode(pem_binary) do
+      entries when is_list(entries) ->
+        for {:Certificate, der, _} <- entries, do: der
+
+      _ ->
+        []
     end
   end
 
@@ -136,15 +163,23 @@ defmodule Varco.TLS.CA do
         {:Extension, _, _, dns_names} when is_list(dns_names) ->
           dns_names
           |> Enum.map(fn
-            {:dNSName, name} -> to_string(name)
+            {:dNSName, name} ->
+              to_string(name)
+
             {:iPAddress, ip} ->
               case :inet.ntoa(ip) do
                 {:error, _} -> to_string(ip)
                 str -> to_string(str)
               end
-            other when is_binary(other) -> other
-            other when is_list(other) -> to_string(other)
-            _ -> nil
+
+            other when is_binary(other) ->
+              other
+
+            other when is_list(other) ->
+              to_string(other)
+
+            _ ->
+              nil
           end)
           |> Enum.reject(&is_nil/1)
 
@@ -152,6 +187,6 @@ defmodule Varco.TLS.CA do
           []
       end
 
-    ([cn | san_domains] |> Enum.reject(&is_nil/1) |> Enum.uniq())
+    [cn | san_domains] |> Enum.reject(&is_nil/1) |> Enum.uniq()
   end
 end

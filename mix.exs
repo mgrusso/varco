@@ -4,7 +4,7 @@ defmodule Varco.MixProject do
   def project do
     [
       app: :varco,
-      version: "0.1.0",
+      version: "0.2.0",
       elixir: ">= 1.17.0",
       start_permanent: Mix.env() == :prod,
       deps: deps()
@@ -26,6 +26,7 @@ defmodule Varco.MixProject do
       {:plug, "~> 1.16"},
       {:finch, "~> 0.19"},
       {:mint, "~> 1.6"},
+      {:mint_web_socket, "~> 1.0"},
       {:req, "~> 0.5"},
       {:x509, "~> 0.9.0"},
       {:jason, "~> 1.4"},

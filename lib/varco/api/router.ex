@@ -13,12 +13,15 @@ defmodule Varco.API.Router do
   alias Varco.Cluster.Sync
   alias Varco.Dashboard.HTML
 
-  plug :match
-  plug Plug.Parsers,
+  plug(:match)
+
+  plug(Plug.Parsers,
     parsers: [:json],
     pass: ["application/json", "text/json"],
     json_decoder: Jason
-  plug :dispatch
+  )
+
+  plug(:dispatch)
 
   # Dashboard
   get "/dashboard" do
