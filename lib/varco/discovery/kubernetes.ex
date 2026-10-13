@@ -64,7 +64,17 @@ defmodule Varco.Discovery.Kubernetes do
           do: :random,
           else: :round_robin
 
-      scheme = Map.get(annotations, "varco.io/upstream-scheme", "http")
+      scheme =
+        cond do
+          s = Map.get(annotations, "varco.io/upstream-scheme") ->
+            String.downcase(s)
+
+          proto = Map.get(annotations, "nginx.ingress.kubernetes.io/backend-protocol") ->
+            if String.upcase(proto) in ["HTTPS", "GRPCS"], do: "https", else: "http"
+
+          true ->
+            "http"
+        end
 
       timeout =
         cond do
