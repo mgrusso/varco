@@ -268,99 +268,130 @@ defmodule Varco.Proxy.Handler do
     # Prepare streaming request body (zero buffering in RAM)
     timeout = route.timeout || 300_000
     body = build_request_body(conn, timeout)
-    method = String.to_atom(String.downcase(conn.method))
-    finch_name = Varco.Finch
 
-    finch_req = Finch.build(method, target_url, headers, body)
+    case parse_method(conn.method) do
+      {:ok, method} ->
+        finch_name = Varco.Finch
+        finch_req = Finch.build(method, target_url, headers, body)
 
-    acc_init = %{
-      conn: conn,
-      status: nil,
-      started: false,
-      bytes: 0,
-      custom_resp_headers: route.response_headers
-    }
+        acc_init = %{
+          conn: conn,
+          status: nil,
+          started: false,
+          bytes: 0,
+          custom_resp_headers: route.response_headers
+        }
 
-    result =
-      Finch.stream(
-        finch_req,
-        finch_name,
-        acc_init,
-        fn
-          {:status, status}, acc ->
-            %{acc | status: status}
+        result =
+          Finch.stream(
+            finch_req,
+            finch_name,
+            acc_init,
+            fn
+              {:status, status}, acc ->
+                %{acc | status: status}
 
-          {:headers, upstream_headers}, acc ->
-            cleaned_headers = filter_hop_by_hop(upstream_headers)
+              {:headers, upstream_headers}, acc ->
+                cleaned_headers = filter_hop_by_hop(upstream_headers)
 
-            c =
-              Enum.reduce(cleaned_headers, acc.conn, fn {k, v}, current_conn ->
-                put_resp_header(current_conn, String.downcase(k), v)
-              end)
+                c =
+                  Enum.reduce(cleaned_headers, acc.conn, fn {k, v}, current_conn ->
+                    put_resp_header(current_conn, String.downcase(k), v)
+                  end)
 
-            c =
-              Enum.reduce(acc.custom_resp_headers, c, fn {k, v}, current_conn ->
-                put_resp_header(current_conn, String.downcase(k), v)
-              end)
+                c =
+                  Enum.reduce(acc.custom_resp_headers, c, fn {k, v}, current_conn ->
+                    put_resp_header(current_conn, String.downcase(k), v)
+                  end)
 
-            # Send chunked header to client
-            c = send_chunked(c, acc.status)
-            %{acc | conn: c, started: true}
+                # Send chunked header to client
+                c = send_chunked(c, acc.status)
+                %{acc | conn: c, started: true}
 
-          {:data, chunk}, acc ->
-            case chunk(acc.conn, chunk) do
-              {:ok, c} ->
-                %{acc | conn: c, bytes: acc.bytes + byte_size(chunk)}
+              {:data, chunk}, acc ->
+                case chunk(acc.conn, chunk) do
+                  {:ok, c} ->
+                    %{acc | conn: c, bytes: acc.bytes + byte_size(chunk)}
 
-              {:error, :closed} ->
-                acc
-            end
-        end,
-        receive_timeout: timeout,
-        request_timeout: timeout
-      )
+                  {:error, :closed} ->
+                    acc
+                end
+            end,
+            receive_timeout: timeout,
+            request_timeout: timeout
+          )
 
-    case result do
-      {:ok, %{conn: completed_conn, status: status, bytes: bytes}} ->
-        completed_conn =
-          case Process.delete(:varco_last_conn) do
-            %Plug.Conn{adapter: updated_adapter} ->
-              %{completed_conn | adapter: updated_adapter}
+        case result do
+          {:ok, %{conn: completed_conn, status: status, bytes: bytes}} ->
+            completed_conn =
+              case Process.delete(:varco_last_conn) do
+                %Plug.Conn{adapter: updated_adapter} ->
+                  %{completed_conn | adapter: updated_adapter}
 
-            _ ->
-              completed_conn
-          end
+                _ ->
+                  completed_conn
+              end
 
-        emit_telemetry(start_time, completed_conn, status, route.id, upstream, bytes)
-        halt(completed_conn)
+            emit_telemetry(start_time, completed_conn, status, route.id, upstream, bytes)
+            halt(completed_conn)
 
-      {:error, reason, %{conn: error_conn, started: false}} ->
-        Process.delete(:varco_last_conn)
-        Logger.error("Upstream connection error (#{upstream}): #{inspect(reason)}")
-        emit_telemetry(start_time, error_conn, 502, route.id, upstream, 0)
+          {:error, reason, %{conn: error_conn, started: false}} ->
+            Process.delete(:varco_last_conn)
+            Logger.error("Upstream connection error (#{upstream}): #{inspect(reason)}")
+            emit_telemetry(start_time, error_conn, 502, route.id, upstream, 0)
 
-        error_conn
-        |> put_resp_content_type("text/plain")
-        |> send_resp(502, "Bad Gateway: Upstream connection failed")
-        |> halt()
+            error_conn
+            |> put_resp_content_type("text/plain")
+            |> send_resp(502, "Bad Gateway: Upstream connection failed")
+            |> halt()
 
-      {:error, reason, %{conn: error_conn, started: true}} ->
-        Process.delete(:varco_last_conn)
-        Logger.error("Upstream connection error mid-stream (#{upstream}): #{inspect(reason)}")
-        emit_telemetry(start_time, error_conn, 502, route.id, upstream, 0)
-        halt(error_conn)
+          {:error, reason, %{conn: error_conn, started: true}} ->
+            Process.delete(:varco_last_conn)
+            Logger.error("Upstream connection error mid-stream (#{upstream}): #{inspect(reason)}")
+            emit_telemetry(start_time, error_conn, 502, route.id, upstream, 0)
+            halt(error_conn)
 
-      {:error, reason} ->
-        Process.delete(:varco_last_conn)
-        Logger.error("Upstream connection error (#{upstream}): #{inspect(reason)}")
-        emit_telemetry(start_time, conn, 502, route.id, upstream, 0)
+          {:error, reason} ->
+            Process.delete(:varco_last_conn)
+            Logger.error("Upstream connection error (#{upstream}): #{inspect(reason)}")
+            emit_telemetry(start_time, conn, 502, route.id, upstream, 0)
+
+            conn
+            |> put_resp_content_type("text/plain")
+            |> send_resp(502, "Bad Gateway: Upstream connection failed")
+            |> halt()
+        end
+
+      {:error, :unsupported_method} ->
+        emit_telemetry(start_time, conn, 405, route.id, upstream, 0)
 
         conn
         |> put_resp_content_type("text/plain")
-        |> send_resp(502, "Bad Gateway: Upstream connection failed")
+        |> send_resp(405, "Method Not Allowed")
         |> halt()
     end
   end
+
+  @supported_methods %{
+    "get" => :get,
+    "post" => :post,
+    "put" => :put,
+    "delete" => :delete,
+    "patch" => :patch,
+    "head" => :head,
+    "options" => :options,
+    "trace" => :trace,
+    "connect" => :connect
+  }
+
+  defp parse_method(method) when is_binary(method) do
+    case Map.get(@supported_methods, String.downcase(method)) do
+      nil -> {:error, :unsupported_method}
+      atom -> {:ok, atom}
+    end
+  end
+
+  defp parse_method(_), do: {:error, :unsupported_method}
 
   # Helpers
 

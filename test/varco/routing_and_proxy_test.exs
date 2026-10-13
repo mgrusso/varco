@@ -299,6 +299,28 @@ defmodule Varco.RoutingAndProxyTest do
     assert conn_xfp.status == 200
   end
 
+  test "rejects unsupported or arbitrary HTTP methods with 405 Method Not Allowed (prevents atom exhaustion)",
+       %{
+         upstream_url: upstream_url
+       } do
+    {:ok, _route} =
+      Table.add_route(%{
+        id: "methods-test-route",
+        host: "methods.local",
+        path: "/test",
+        upstreams: [upstream_url],
+        tls: false
+      })
+
+    conn_invalid =
+      Plug.Test.conn("RANDOMMETHOD123", "/test")
+      |> Map.put(:host, "methods.local")
+      |> Handler.call([])
+
+    assert conn_invalid.status == 405
+    assert conn_invalid.resp_body == "Method Not Allowed"
+  end
+
   test "end-to-end WebSocket proxying with bidirectional message and control frames", %{
     upstream_url: upstream_url,
     proxy_port: proxy_port

@@ -21,6 +21,7 @@ defmodule Varco.API.Router do
     json_decoder: Jason
   )
 
+  plug(:authenticate_admin)
   plug(:dispatch)
 
   # Dashboard & Root Redirect
@@ -49,6 +50,47 @@ defmodule Varco.API.Router do
   # Health & Ping
   get "/api/v1/ping" do
     json(conn, 200, %{status: "ok", service: "varco"})
+  end
+
+  # Prometheus Exposition Format Metrics
+  get "/metrics" do
+    routes_count = length(Table.list_routes())
+    certs_count = length(CertificateStore.list_certificates())
+    beam_memory = :erlang.memory(:total)
+    beam_procs = :erlang.system_info(:process_count)
+    beam_schedulers = :erlang.system_info(:schedulers_online)
+    uptime = :erlang.element(1, :erlang.statistics(:wall_clock)) |> div(1000)
+
+    body = """
+    # HELP varco_active_routes_count Number of currently active reverse proxy routes
+    # TYPE varco_active_routes_count gauge
+    varco_active_routes_count #{routes_count}
+
+    # HELP varco_active_certificates_count Number of TLS certificates currently managed
+    # TYPE varco_active_certificates_count gauge
+    varco_active_certificates_count #{certs_count}
+
+    # HELP varco_beam_memory_bytes Total BEAM VM allocated memory in bytes
+    # TYPE varco_beam_memory_bytes gauge
+    varco_beam_memory_bytes #{beam_memory}
+
+    # HELP varco_beam_processes Total number of active Erlang processes
+    # TYPE varco_beam_processes gauge
+    varco_beam_processes #{beam_procs}
+
+    # HELP varco_beam_schedulers Number of online Erlang schedulers
+    # TYPE varco_beam_schedulers gauge
+    varco_beam_schedulers #{beam_schedulers}
+
+    # HELP varco_uptime_seconds Total uptime in seconds
+    # TYPE varco_uptime_seconds counter
+    varco_uptime_seconds #{uptime}
+    """
+
+    conn
+    |> put_resp_header("access-control-allow-origin", "*")
+    |> put_resp_content_type("text/plain; version=0.0.4")
+    |> send_resp(200, body)
   end
 
   # Routes Endpoints
@@ -185,5 +227,75 @@ defmodule Varco.API.Router do
       load_balancer: r.load_balancer,
       metadata: r.metadata
     }
+  end
+
+  defp authenticate_admin(conn, _opts) do
+    cond do
+      conn.request_path in ["/api/v1/ping", "/metrics"] ->
+        conn
+
+      conn.method == "OPTIONS" ->
+        conn
+
+      true ->
+        token = System.get_env("VARCO_ADMIN_TOKEN")
+        password = System.get_env("VARCO_ADMIN_PASSWORD")
+        user = System.get_env("VARCO_ADMIN_USER", "admin")
+
+        if (token && token != "") || (password && password != "") do
+          if authorized?(conn, token, user, password) do
+            conn
+          else
+            conn
+            |> put_resp_header("www-authenticate", "Basic realm=\"Varco Admin\"")
+            |> put_resp_header("access-control-allow-origin", "*")
+            |> put_resp_content_type("application/json")
+            |> send_resp(
+              401,
+              Jason.encode!(%{
+                error: "unauthorized",
+                message: "Valid Bearer token or Basic auth required"
+              })
+            )
+            |> halt()
+          end
+        else
+          conn
+        end
+    end
+  end
+
+  defp authorized?(conn, token, user, password) do
+    case get_req_header(conn, "authorization") do
+      ["Bearer " <> req_token | _] when is_binary(token) and token != "" ->
+        Plug.Crypto.secure_compare(req_token, token)
+
+      ["Basic " <> encoded | _] when is_binary(password) and password != "" ->
+        case Base.decode64(encoded, ignore: :whitespace) do
+          {:ok, decoded} ->
+            case String.split(decoded, ":", parts: 2) do
+              [u, p] ->
+                Plug.Crypto.secure_compare(u, user) and Plug.Crypto.secure_compare(p, password)
+
+              _ ->
+                false
+            end
+
+          _ ->
+            false
+        end
+
+      _ ->
+        conn = Plug.Conn.fetch_query_params(conn)
+
+        case conn.query_params["token"] do
+          req_token
+          when is_binary(req_token) and req_token != "" and is_binary(token) and token != "" ->
+            Plug.Crypto.secure_compare(req_token, token)
+
+          _ ->
+            false
+        end
+    end
   end
 end

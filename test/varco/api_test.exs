@@ -143,4 +143,49 @@ defmodule Varco.APITest do
     cluster = Jason.decode!(conn.resp_body)
     assert Map.has_key?(cluster, "node_count")
   end
+
+  test "serves Prometheus format metrics on /metrics" do
+    conn =
+      Plug.Test.conn(:get, "/metrics")
+      |> Router.call([])
+
+    assert conn.status == 200
+
+    assert Plug.Conn.get_resp_header(conn, "content-type") == [
+             "text/plain; version=0.0.4; charset=utf-8"
+           ]
+
+    assert conn.resp_body =~ "varco_active_routes_count"
+    assert conn.resp_body =~ "varco_beam_memory_bytes"
+    assert conn.resp_body =~ "varco_uptime_seconds"
+  end
+
+  test "enforces Admin Authentication when VARCO_ADMIN_TOKEN or VARCO_ADMIN_PASSWORD is set" do
+    System.put_env("VARCO_ADMIN_TOKEN", "secret-test-token")
+
+    # Unauthorized request without header
+    conn_unauth =
+      Plug.Test.conn(:get, "/api/v1/routes")
+      |> Router.call([])
+
+    assert conn_unauth.status == 401
+    assert Jason.decode!(conn_unauth.resp_body)["error"] == "unauthorized"
+
+    # Authorized request with Bearer token
+    conn_auth =
+      Plug.Test.conn(:get, "/api/v1/routes")
+      |> Plug.Conn.put_req_header("authorization", "Bearer secret-test-token")
+      |> Router.call([])
+
+    assert conn_auth.status == 200
+
+    # Health ping remains unauthenticated
+    conn_ping =
+      Plug.Test.conn(:get, "/api/v1/ping")
+      |> Router.call([])
+
+    assert conn_ping.status == 200
+  after
+    System.delete_env("VARCO_ADMIN_TOKEN")
+  end
 end

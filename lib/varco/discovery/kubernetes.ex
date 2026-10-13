@@ -230,7 +230,8 @@ defmodule Varco.Discovery.Kubernetes do
       insecure_skip_tls_verify: insecure_skip_tls_verify,
       ingress_class: ingress_class,
       last_sync: nil,
-      last_error: nil
+      last_error: nil,
+      synced_secrets: %{}
     }
 
     if enabled do
@@ -311,8 +312,9 @@ defmodule Varco.Discovery.Kubernetes do
             end
           end)
 
-        # 2. Sync referenced TLS secrets (cert-manager support)
-        synced_secrets = sync_tls_secrets(matching_ingresses, state)
+        # 2. Sync referenced TLS secrets (cert-manager support with resourceVersion caching)
+        {synced_secrets_count, updated_synced_secrets} =
+          sync_tls_secrets(matching_ingresses, state)
 
         # 3. Synchronize routes into Table (add new/updated, remove stale)
         existing_k8s_routes =
@@ -329,22 +331,30 @@ defmodule Varco.Discovery.Kubernetes do
           end
         end
 
-        # Add or update routes
+        # Add or update routes only when modified
         for route <- new_routes do
-          Table.add_route(route)
-          Sync.broadcast_route_upsert(route)
+          existing = Enum.find(existing_k8s_routes, &(&1.id == route.id))
+
+          if existing != route do
+            Table.add_route(route)
+            Sync.broadcast_route_upsert(route)
+          end
         end
 
         Logger.debug(
-          "Kubernetes sync complete: #{length(new_routes)} routes active, #{length(synced_secrets)} TLS secrets synced"
+          "Kubernetes sync complete: #{length(new_routes)} routes active, #{synced_secrets_count} TLS secrets managed"
         )
 
-        new_state = %{state | last_sync: DateTime.utc_now(), last_error: nil}
+        new_state =
+          state
+          |> Map.put(:synced_secrets, updated_synced_secrets)
+          |> Map.put(:last_sync, DateTime.utc_now())
+          |> Map.put(:last_error, nil)
 
         {:ok,
          %{
            routes_count: length(new_routes),
-           tls_secrets_count: length(synced_secrets)
+           tls_secrets_count: synced_secrets_count
          }, new_state}
 
       {:ok, status, body} ->
@@ -365,45 +375,56 @@ defmodule Varco.Discovery.Kubernetes do
       |> Enum.flat_map(&extract_tls_secrets/1)
       |> Enum.uniq_by(&{&1.namespace, &1.secret_name})
 
-    for secret <- secrets_to_fetch do
-      sync_single_secret(secret, state)
-    end
-    |> Enum.filter(&match?({:ok, _}, &1))
+    Enum.reduce(secrets_to_fetch, {0, Map.get(state, :synced_secrets, %{})}, fn secret,
+                                                                                {count, cache} ->
+      case sync_single_secret(secret, state, cache) do
+        {:ok, new_cache} -> {count + 1, new_cache}
+        {:skipped, cache} -> {count + 1, cache}
+        _ -> {count, cache}
+      end
+    end)
   end
 
-  defp sync_single_secret(secret, state) do
+  defp sync_single_secret(secret, state, cache) do
     url = "#{state.api_url}/api/v1/namespaces/#{secret.namespace}/secrets/#{secret.secret_name}"
+    cache_key = {secret.namespace, secret.secret_name}
 
     case k8s_get(url, state) do
       {:ok, 200, secret_body} ->
-        data = Map.get(secret_body, "data", %{})
-        crt_b64 = Map.get(data, "tls.crt")
-        key_b64 = Map.get(data, "tls.key")
+        resource_version = get_in(secret_body, ["metadata", "resourceVersion"])
 
-        if crt_b64 && key_b64 do
-          with {:ok, cert_pem} <- Base.decode64(crt_b64, ignore: :whitespace),
-               {:ok, key_pem} <- Base.decode64(key_b64, ignore: :whitespace),
-               {:ok, meta} <-
-                 CertificateStore.add_custom_certificate(cert_pem, key_pem, secret.hosts) do
-            Logger.info(
-              "Synchronized K8s TLS secret #{secret.namespace}/#{secret.secret_name} for domains #{inspect(meta.domains)}"
-            )
+        if resource_version != nil and Map.get(cache, cache_key) == resource_version do
+          {:skipped, cache}
+        else
+          data = Map.get(secret_body, "data", %{})
+          crt_b64 = Map.get(data, "tls.crt")
+          key_b64 = Map.get(data, "tls.key")
 
-            {:ok, secret.secret_name}
-          else
-            {:error, reason} ->
-              Logger.warning(
-                "Failed to decode/install K8s TLS secret #{secret.namespace}/#{secret.secret_name}: #{inspect(reason)}"
+          if crt_b64 && key_b64 do
+            with {:ok, cert_pem} <- Base.decode64(crt_b64, ignore: :whitespace),
+                 {:ok, key_pem} <- Base.decode64(key_b64, ignore: :whitespace),
+                 {:ok, meta} <-
+                   CertificateStore.add_custom_certificate(cert_pem, key_pem, secret.hosts) do
+              Logger.info(
+                "Synchronized K8s TLS secret #{secret.namespace}/#{secret.secret_name} (version #{resource_version}) for domains #{inspect(meta.domains)}"
               )
 
-              {:error, reason}
-          end
-        else
-          Logger.warning(
-            "K8s Secret #{secret.namespace}/#{secret.secret_name} is missing tls.crt or tls.key data"
-          )
+              {:ok, Map.put(cache, cache_key, resource_version)}
+            else
+              {:error, reason} ->
+                Logger.warning(
+                  "Failed to decode/install K8s TLS secret #{secret.namespace}/#{secret.secret_name}: #{inspect(reason)}"
+                )
 
-          {:error, :missing_tls_keys}
+                {:error, reason}
+            end
+          else
+            Logger.warning(
+              "K8s Secret #{secret.namespace}/#{secret.secret_name} is missing tls.crt or tls.key data"
+            )
+
+            {:error, :missing_tls_keys}
+          end
         end
 
       {:ok, 404, _} ->

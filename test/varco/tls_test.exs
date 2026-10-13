@@ -28,8 +28,20 @@ defmodule Varco.TLSTest do
     assert "app.test" in domains
   end
 
-  test "dynamic SNI resolves and generates certificates automatically" do
-    # When requesting an unknown domain with auto_self_signed enabled
+  test "dynamic SNI resolves and generates certificates for configured routes, and rejects unconfigured hosts" do
+    # 1. Unconfigured host: does not dynamically generate cert or pollute cache
+    unconfigured_opts = CertificateStore.sni_fun(~c"scanner.unconfigured.test")
+    assert unconfigured_opts == CertificateStore.default_cert_options()
+    assert CertificateStore.lookup_cert("scanner.unconfigured.test") == nil
+
+    # 2. Configured route host: dynamically generates leaf cert
+    {:ok, _route} =
+      Varco.Routing.Table.add_route(%{
+        id: "zero-config-route",
+        host: "zero-config.example.com",
+        upstream: "http://127.0.0.1:8080"
+      })
+
     ssl_opts = CertificateStore.sni_fun(~c"zero-config.example.com")
     assert Keyword.has_key?(ssl_opts, :cert)
     assert Keyword.has_key?(ssl_opts, :key)

@@ -80,19 +80,19 @@ defmodule Varco.Dashboard.HTML do
         <div class="stats-grid">
           <div class="stat-card">
             <div class="stat-label">Active Routes</div>
-            <div class="stat-val" id="stat-routes">0</div>
+            <div class="stat-val" id="stat-routes">--</div>
           </div>
           <div class="stat-card">
             <div class="stat-label">TLS Certificates</div>
-            <div class="stat-val" id="stat-certs">0</div>
+            <div class="stat-val" id="stat-certs">--</div>
           </div>
           <div class="stat-card">
             <div class="stat-label">Cluster Nodes</div>
-            <div class="stat-val" id="stat-nodes">1</div>
+            <div class="stat-val" id="stat-nodes">--</div>
           </div>
           <div class="stat-card">
             <div class="stat-label">BEAM Memory</div>
-            <div class="stat-val" id="stat-mem">0 MB</div>
+            <div class="stat-val" id="stat-mem">-- MB</div>
           </div>
         </div>
 
