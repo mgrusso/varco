@@ -297,7 +297,13 @@ defmodule Varco.Proxy.Handler do
 
                 c =
                   Enum.reduce(cleaned_headers, acc.conn, fn {k, v}, current_conn ->
-                    put_resp_header(current_conn, String.downcase(k), v)
+                    key = String.downcase(k)
+
+                    if key == "set-cookie" do
+                      prepend_resp_headers(current_conn, [{"set-cookie", v}])
+                    else
+                      put_resp_header(current_conn, key, v)
+                    end
                   end)
 
                 c =
