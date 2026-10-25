@@ -57,6 +57,10 @@ defmodule Varco.RoutingAndProxyTest do
             "x-received-xff",
             List.first(get_req_header(conn, "x-forwarded-for")) || "none"
           )
+          |> put_resp_header(
+            "x-received-host",
+            List.first(get_req_header(conn, "host")) || "none"
+          )
           |> send_resp(200, "Upstream body: #{body}")
 
         "/auth-challenge" ->
@@ -180,6 +184,7 @@ defmodule Varco.RoutingAndProxyTest do
     assert List.first(get_resp_header(conn, "x-upstream-header")) == "custom-value"
     # Verify X-Forwarded-For was chained
     assert List.first(get_resp_header(conn, "x-received-xff")) =~ "192.168.1.50"
+    assert List.first(get_resp_header(conn, "x-received-host")) =~ "app.local"
   end
 
   test "path stripping removes route prefix before forwarding", %{upstream_url: upstream_url} do

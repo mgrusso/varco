@@ -479,6 +479,7 @@ defmodule Varco.Proxy.Handler do
 
     headers =
       cleaned
+      |> List.keystore("host", 0, {"host", get_request_host(conn)})
       |> List.keystore("x-forwarded-for", 0, {"x-forwarded-for", existing_xff})
       |> List.keystore("x-forwarded-proto", 0, {"x-forwarded-proto", to_string(conn.scheme)})
       |> List.keystore("x-forwarded-host", 0, {"x-forwarded-host", get_request_host(conn)})
