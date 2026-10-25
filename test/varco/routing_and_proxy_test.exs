@@ -59,6 +59,14 @@ defmodule Varco.RoutingAndProxyTest do
           )
           |> send_resp(200, "Upstream body: #{body}")
 
+        "/auth-challenge" ->
+          conn
+          |> prepend_resp_headers([
+            {"www-authenticate", "Bearer realm=\"example.com\", charset=\"UTF-8\""},
+            {"www-authenticate", "Basic realm=\"example.com\", charset=\"UTF-8\""}
+          ])
+          |> send_resp(401, "Unauthorized")
+
         "/api/data" ->
           conn |> send_resp(200, ~s({"status":"ok"}))
 
@@ -339,6 +347,34 @@ defmodule Varco.RoutingAndProxyTest do
       |> Handler.call([])
 
     assert conn.status in [200, 207]
+  end
+
+  test "preserves multiple www-authenticate response headers from upstream", %{
+    upstream_url: upstream_url
+  } do
+    {:ok, _route} =
+      Table.add_route(%{
+        id: "auth-challenge-route",
+        host: "auth-challenge.local",
+        path: "/auth-challenge",
+        upstreams: [upstream_url],
+        tls: false
+      })
+
+    conn =
+      Plug.Test.conn("GET", "/auth-challenge")
+      |> Map.put(:host, "auth-challenge.local")
+      |> Handler.call([])
+
+    assert conn.status == 401
+
+    auth_headers =
+      Enum.filter(conn.resp_headers, fn {k, _v} -> k == "www-authenticate" end)
+      |> Enum.map(fn {_k, v} -> v end)
+
+    assert length(auth_headers) == 2
+    assert Enum.any?(auth_headers, &String.starts_with?(&1, "Bearer"))
+    assert Enum.any?(auth_headers, &String.starts_with?(&1, "Basic"))
   end
 
   test "end-to-end WebSocket proxying with bidirectional message and control frames", %{
