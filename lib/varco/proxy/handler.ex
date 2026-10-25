@@ -299,7 +299,13 @@ defmodule Varco.Proxy.Handler do
                   Enum.reduce(cleaned_headers, acc.conn, fn {k, v}, current_conn ->
                     key = String.downcase(k)
 
-                    if key in ["set-cookie", "www-authenticate", "proxy-authenticate", "link", "warning"] do
+                    if key in [
+                         "set-cookie",
+                         "www-authenticate",
+                         "proxy-authenticate",
+                         "link",
+                         "warning"
+                       ] do
                       prepend_resp_headers(current_conn, [{key, v}])
                     else
                       put_resp_header(current_conn, key, v)

@@ -289,6 +289,18 @@ defmodule Varco.DiscoveryTest do
              }
     end
 
+    test "parse_status_addresses parses IPv4, IPv6, and hostnames" do
+      assert Kubernetes.parse_status_addresses(nil) == []
+      assert Kubernetes.parse_status_addresses("") == []
+      assert Kubernetes.parse_status_addresses("10.43.110.98") == [%{"ip" => "10.43.110.98"}]
+
+      assert Kubernetes.parse_status_addresses("10.43.110.98, 2001:db8::1, lb.example.com") == [
+               %{"ip" => "10.43.110.98"},
+               %{"ip" => "2001:db8::1"},
+               %{"hostname" => "lb.example.com"}
+             ]
+    end
+
     test "synchronizes Ingresses from K8s API and loads cert-manager TLS Secrets" do
       alias Varco.TLS.{CA, CertificateStore}
 
@@ -353,20 +365,31 @@ defmodule Varco.DiscoveryTest do
         }
       }
 
+      test_pid = self()
+
       # Mock K8s API server using Bandit
       {:ok, k8s_mock} =
         Bandit.start_link(
           plug: fn conn, _opts ->
-            case conn.request_path do
-              "/apis/networking.k8s.io/v1/ingresses" ->
+            case {conn.method, conn.request_path} do
+              {"GET", "/apis/networking.k8s.io/v1/ingresses"} ->
                 conn
                 |> Plug.Conn.put_resp_content_type("application/json")
                 |> Plug.Conn.send_resp(200, Jason.encode!(ingress_data))
 
-              "/api/v1/namespaces/production/secrets/web-tls-secret" ->
+              {"GET", "/api/v1/namespaces/production/secrets/web-tls-secret"} ->
                 conn
                 |> Plug.Conn.put_resp_content_type("application/json")
                 |> Plug.Conn.send_resp(200, Jason.encode!(secret_data))
+
+              {"PATCH",
+               "/apis/networking.k8s.io/v1/namespaces/production/ingresses/web-ingress/status"} ->
+                {:ok, body, conn} = Plug.Conn.read_body(conn)
+                send(test_pid, {:patch_status, Jason.decode!(body)})
+
+                conn
+                |> Plug.Conn.put_resp_content_type("application/json")
+                |> Plug.Conn.send_resp(200, "{}")
 
               _ ->
                 conn |> Plug.Conn.send_resp(404, "Not Found")
@@ -386,11 +409,20 @@ defmodule Varco.DiscoveryTest do
         insecure_skip_tls_verify: true,
         ingress_class: "varco",
         interval: 10_000,
+        status_addresses: [%{"ip" => "10.43.110.98"}],
         last_sync: nil,
         last_error: nil
       }
 
       assert {:ok, result, _new_state} = Kubernetes.perform_sync(sync_state)
+
+      assert_receive {:patch_status,
+                      %{
+                        "status" => %{
+                          "loadBalancer" => %{"ingress" => [%{"ip" => "10.43.110.98"}]}
+                        }
+                      }}
+
       assert result.routes_count == 1
       assert result.tls_secrets_count == 1
 

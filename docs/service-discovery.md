@@ -86,7 +86,7 @@ When running inside a Kubernetes cluster (or configured via `KUBERNETES_API_URL`
 1. Polls `/apis/networking.k8s.io/v1/ingresses` for Ingress resources matching `ingressClassName: varco`.
 2. Synchronizes discovered routes dynamically into Varco's lock-free routing table, removing stale routes on Ingress deletion.
 3. Reads any referenced TLS secrets (`spec.tls[*].secretName`) from `/api/v1/namespaces/{namespace}/secrets/{secret_name}`. Decodes `tls.crt` and `tls.key` (supporting Let's Encrypt certificates managed by cert-manager) and installs them in `Varco.TLS.CertificateStore`.
-
+4. Synchronizes and updates `.status.loadBalancer.ingress` on managed Ingress resources when `VARCO_K8S_PUBLISH_STATUS_ADDRESS` or `VARCO_K8S_STATUS_IP` is configured (supporting both IP addresses and hostnames), ensuring GitOps tools such as ArgoCD immediately reflect healthy Ingress status.
 Varco resolves upstream service endpoints using cluster-internal DNS:
 ```text
 http://customer-service.production.svc.cluster.local:8080

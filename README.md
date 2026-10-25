@@ -134,7 +134,8 @@ By default:
 | `VARCO_CONFIG` | Path to static YAML or JSON config | `varco.yaml` |
 | `VARCO_CLUSTER_STRATEGY` | Cluster strategy (`kubernetes`, `gossip`, `epmd`, `none`) | `none` |
 | `VARCO_K8S_SERVICE_NAME` | K8s headless service for node discovery | `varco-headless` |
-
+| `VARCO_K8S_INGRESS_CLASS` | Ingress classes to watch (e.g. `varco`, `nginx,varco`) | `varco` |
+| `VARCO_K8S_PUBLISH_STATUS_ADDRESS` | IP/hostnames to report in Ingress `status.loadBalancer` | `none` |
 ---
 
 ## Configuration Examples

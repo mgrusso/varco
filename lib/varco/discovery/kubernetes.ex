@@ -249,6 +249,39 @@ defmodule Varco.Discovery.Kubernetes do
 
   defp extract_tls_hosts(_), do: []
 
+  @doc """
+  Parses a comma-separated string or list of IP addresses/hostnames into a list of
+  Kubernetes loadBalancer ingress maps (`%{"ip" => ...}` or `%{"hostname" => ...}`).
+  """
+  @spec parse_status_addresses(nil | String.t() | [map() | String.t()]) :: [map()]
+  def parse_status_addresses(nil), do: []
+  def parse_status_addresses(""), do: []
+
+  def parse_status_addresses(addresses) when is_binary(addresses) do
+    addresses
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.map(&format_status_entry/1)
+  end
+
+  def parse_status_addresses(list) when is_list(list) do
+    Enum.map(list, fn
+      %{"ip" => _} = map -> map
+      %{"hostname" => _} = map -> map
+      addr when is_binary(addr) -> format_status_entry(addr)
+    end)
+  end
+
+  def parse_status_addresses(_), do: []
+
+  defp format_status_entry(addr) do
+    case :inet.parse_address(String.to_charlist(addr)) do
+      {:ok, _} -> %{"ip" => addr}
+      {:error, _} -> %{"hostname" => addr}
+    end
+  end
+
   # Server Callbacks
 
   @impl true
@@ -265,6 +298,13 @@ defmodule Varco.Discovery.Kubernetes do
     default_class = System.get_env("VARCO_K8S_INGRESS_CLASS", @ingress_class)
     ingress_class = Keyword.get(opts, :ingress_class, default_class)
 
+    default_publish_status =
+      System.get_env("VARCO_K8S_PUBLISH_STATUS_ADDRESS") ||
+        System.get_env("VARCO_K8S_STATUS_IP")
+
+    publish_status_address = Keyword.get(opts, :publish_status_address, default_publish_status)
+    status_addresses = parse_status_addresses(publish_status_address)
+
     state = %{
       enabled: enabled,
       interval: interval,
@@ -273,6 +313,7 @@ defmodule Varco.Discovery.Kubernetes do
       ca_cert_path: ca_cert_path,
       insecure_skip_tls_verify: insecure_skip_tls_verify,
       ingress_class: ingress_class,
+      status_addresses: status_addresses,
       last_sync: nil,
       last_error: nil,
       synced_secrets: %{}
@@ -306,6 +347,7 @@ defmodule Varco.Discovery.Kubernetes do
       enabled: state.enabled,
       api_url: state.api_url,
       ingress_class: state.ingress_class,
+      status_addresses: state.status_addresses,
       interval: state.interval,
       last_sync: state.last_sync,
       last_error: state.last_error
@@ -384,6 +426,9 @@ defmodule Varco.Discovery.Kubernetes do
             Sync.broadcast_route_upsert(route)
           end
         end
+
+        # 4. Synchronize Ingress loadBalancer status if configured
+        sync_ingress_statuses(matching_ingresses, state)
 
         Logger.debug(
           "Kubernetes sync complete: #{length(new_routes)} routes active, #{synced_secrets_count} TLS secrets managed"
@@ -500,17 +545,7 @@ defmodule Varco.Discovery.Kubernetes do
       {"accept", "application/json"}
     ]
 
-    connect_opts =
-      cond do
-        state.insecure_skip_tls_verify ->
-          [transport_opts: [verify: :verify_none]]
-
-        state.ca_cert_path && File.exists?(state.ca_cert_path) ->
-          [transport_opts: [cacertfile: state.ca_cert_path]]
-
-        true ->
-          []
-      end
+    connect_opts = k8s_connect_opts(state)
 
     case Req.get(url,
            headers: headers,
@@ -532,6 +567,103 @@ defmodule Varco.Discovery.Kubernetes do
         {:ok, status, parsed_body}
 
       {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp k8s_patch(url, body, state) do
+    headers = [
+      {"authorization", "Bearer " <> (state.token || "")},
+      {"content-type", "application/merge-patch+json"},
+      {"accept", "application/json"}
+    ]
+
+    connect_opts = k8s_connect_opts(state)
+
+    case Req.patch(url,
+           headers: headers,
+           body: body,
+           connect_options: connect_opts,
+           retry: false,
+           receive_timeout: 10_000
+         ) do
+      {:ok, %Req.Response{status: status, body: resp_body}} when status in 200..299 ->
+        {:ok, status, resp_body}
+
+      {:ok, %Req.Response{status: status, body: resp_body}} ->
+        {:error, {:http_error, status, resp_body}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp k8s_connect_opts(state) do
+    cond do
+      state.insecure_skip_tls_verify ->
+        [transport_opts: [verify: :verify_none]]
+
+      state.ca_cert_path && File.exists?(state.ca_cert_path) ->
+        [transport_opts: [cacertfile: state.ca_cert_path]]
+
+      true ->
+        []
+    end
+  end
+
+  defp sync_ingress_statuses(ingresses, state) do
+    case Map.get(state, :status_addresses, []) do
+      [] ->
+        :ok
+
+      desired_entries ->
+        for ingress <- ingresses do
+          metadata = Map.get(ingress, "metadata", %{})
+          namespace = Map.get(metadata, "namespace", "default")
+          name = Map.get(metadata, "name")
+          current_entries = get_in(ingress, ["status", "loadBalancer", "ingress"]) || []
+
+          if name && status_needs_update?(current_entries, desired_entries) do
+            patch_ingress_status(namespace, name, desired_entries, state)
+          end
+        end
+
+        :ok
+    end
+  end
+
+  defp status_needs_update?(current_entries, desired_entries) do
+    desired_set = MapSet.new(desired_entries)
+    current_set = MapSet.new(current_entries)
+    not MapSet.subset?(desired_set, current_set)
+  end
+
+  defp patch_ingress_status(namespace, name, desired_entries, state) do
+    url =
+      "#{state.api_url}/apis/networking.k8s.io/v1/namespaces/#{namespace}/ingresses/#{name}/status"
+
+    body =
+      Jason.encode!(%{
+        "status" => %{
+          "loadBalancer" => %{
+            "ingress" => desired_entries
+          }
+        }
+      })
+
+    case k8s_patch(url, body, state) do
+      {:ok, _status, _resp} ->
+        Logger.info(
+          "Updated status.loadBalancer for Ingress #{namespace}/#{name} to #{inspect(desired_entries)}"
+        )
+
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Failed to update status for Ingress #{namespace}/#{name}: #{inspect(reason)}"
+        )
+
         {:error, reason}
     end
   end
