@@ -321,6 +321,26 @@ defmodule Varco.RoutingAndProxyTest do
     assert conn_invalid.resp_body == "Method Not Allowed"
   end
 
+  test "proxies WebDAV methods (PROPFIND, MKCOL, etc.) to upstream", %{
+    upstream_url: upstream_url
+  } do
+    {:ok, _route} =
+      Table.add_route(%{
+        id: "webdav-test-route",
+        host: "webdav.local",
+        path: "/dav",
+        upstreams: [upstream_url],
+        tls: false
+      })
+
+    conn =
+      Plug.Test.conn("PROPFIND", "/dav/files")
+      |> Map.put(:host, "webdav.local")
+      |> Handler.call([])
+
+    assert conn.status in [200, 207]
+  end
+
   test "end-to-end WebSocket proxying with bidirectional message and control frames", %{
     upstream_url: upstream_url,
     proxy_port: proxy_port

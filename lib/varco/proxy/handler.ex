@@ -379,7 +379,17 @@ defmodule Varco.Proxy.Handler do
     "head" => :head,
     "options" => :options,
     "trace" => :trace,
-    "connect" => :connect
+    "connect" => :connect,
+    # WebDAV methods
+    "propfind" => "PROPFIND",
+    "proppatch" => "PROPPATCH",
+    "mkcol" => "MKCOL",
+    "copy" => "COPY",
+    "move" => "MOVE",
+    "lock" => "LOCK",
+    "unlock" => "UNLOCK",
+    "report" => "REPORT",
+    "search" => "SEARCH"
   }
 
   defp parse_method(method) when is_binary(method) do
